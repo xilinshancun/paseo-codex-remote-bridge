@@ -247,5 +247,52 @@ class InstallTests(unittest.TestCase):
             self.assertTrue(app_server_input(args))
 
 
+class ClaudeInstallTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.install = Path(self.temp.name) / 'claude'
+        self.args = ['--agent', 'claude', '--ssh-host', 'devbox-test', '--profile', 'claude-test',
+                     '--local-claude-bin', '/Applications/Test App/bin/claude',
+                     '--remote-claude-bin', '~/.local/bin/claude',
+                     '--remote-session-root', '~/.claude/paseo-mac-workspaces',
+                     '--install-dir', str(self.install)]
+
+    def test_claude_install_has_no_token_tunnel_or_machine_secrets(self):
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/install.py')] + self.args,
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        names = {x.name for x in self.install.iterdir()}
+        self.assertEqual(names, {'claude-remote', 'claude_bridge.py', 'bridge.json', 'provider.json'})
+        self.assertFalse((self.install / 'exec-server.token').exists())
+        self.assertFalse((self.install / 'ssh-tunnel.plist').exists())
+        config = json.loads((self.install / 'bridge.json').read_text())
+        self.assertEqual(config['agent'], 'claude')
+        self.assertEqual(config['ssh_host'], 'devbox-test')
+        self.assertNotIn('port', config)
+        provider = json.loads((self.install / 'provider.json').read_text())['agents']['providers']['claude-test']
+        self.assertEqual(provider['extends'], 'claude')
+        installed = self.install.resolve()
+        self.assertEqual(provider['command'], [str(installed / 'claude-remote')])
+        self.assertEqual(provider['env']['CLAUDE_CONFIG_DIR'], str(installed))
+        source = (self.install / 'claude_bridge.py').read_text()
+        self.assertNotIn('20.125.', source)
+        self.assertNotIn('azure_cc_us', source)
+        self.assertNotIn('auth_bearer_token', source)
+        self.assertEqual(stat.S_IMODE((self.install / 'bridge.json').stat().st_mode), 0o600)
+        subprocess.run(['/bin/sh', '-n', str(self.install / 'claude-remote')], check=True)
+
+    def test_claude_update_preserves_bridge_json(self):
+        subprocess.run([sys.executable, str(ROOT / 'scripts/install.py')] + self.args,
+                       check=True, capture_output=True, timeout=10)
+        before = (self.install / 'bridge.json').read_bytes()
+        (self.install / 'claude_bridge.py').write_text('old\n')
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/install.py'), '--update',
+                                 '--install-dir', str(self.install)], capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.install / 'bridge.json').read_bytes(), before)
+        self.assertNotEqual((self.install / 'claude_bridge.py').read_text(), 'old\n')
+
+
 if __name__ == '__main__':
     unittest.main()

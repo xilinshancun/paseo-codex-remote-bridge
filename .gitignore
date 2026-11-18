@@ -16,3 +16,11 @@ auth.json.*
 bridge.json
 provider.json
 remote-environments.toml
+id_rsa
+id_ed25519
+id_ed25519_*
+*.pem
+*.key
+known_hosts
+credentials.json
+ssh.sock

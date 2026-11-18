@@ -1,6 +1,8 @@
 # 安装、迁移与维护
 
-以下使用 `devbox`、`codex-remote`、端口 `18733` 作为示例。可以自选 SSH 别名、Codex 配置目录、provider 名称和端口，每个实例保持一致即可。
+执行接入的 agent 先按 [README](../README.md) 做完。Codex 和 Claude 是两条命令：Codex 生成 exec-server 凭证和反向隧道，Claude 不生成这两样。下面是 Codex 实例的细节。示例用 `devbox`、`codex-remote`、端口 `18733`。每个实例的 SSH 别名、配置目录、provider 名称和端口保持一致。
+
+Claude 的安装命令是 `python3 scripts/install.py --agent claude ...`。它不写 `environments.toml`，也不注册 launchd。登录在开发机的 Claude Code 上完成。
 
 ## 1. 准备两端程序
 
