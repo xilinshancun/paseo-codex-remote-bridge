@@ -1,0 +1,4 @@
+{
+  "mac_info": ["/usr/bin/uname", "-sm"],
+  "project_path": ["/bin/pwd"]
+}

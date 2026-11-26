@@ -1,0 +1,1934 @@
+diff --git a/docs/agent-lifecycle.md b/docs/agent-lifecycle.md
+index 3eec9fb56..028adc358 100644
+--- a/docs/agent-lifecycle.md
++++ b/docs/agent-lifecycle.md
+@@ -46,6 +46,10 @@ Reload releases the old runtime before resuming its durable session: an idle pro
+ still own an exclusive writer. A close failure retains that runtime for cleanup and blocks the
+ replacement. Once closure succeeds, a failed resume leaves the durable agent closed and retryable.
+ 
++Use `agent.session.reload_if_idle.request` for changes that can wait until a turn finishes. It
++returns `busy` while a turn, permission request, or lifecycle operation owns the agent. Once the
++reload starts, incoming prompts wait for the replacement. Archived agents stay archived.
++
+ Idle resumable runtimes are collected after one hour without activity, checked once a minute.
+ Collection releases the process and preserves the agent record, conversation, relationships, and
+ provider session. The next prompt resumes that session. Set `agents.idleRuntimeCleanup: false` in
+diff --git a/docs/plugins.md b/docs/plugins.md
+index ffae136cc..ec2cadbaf 100644
+--- a/docs/plugins.md
++++ b/docs/plugins.md
+@@ -636,6 +636,12 @@ Mounted surfaces and command invocations have shorter API lifetimes.
+ Keep the client entry synchronous: return its cleanup function immediately and start asynchronous
+ work inside it. See the maintained [composer pill example](../plugin-examples/local-plugin/client/main.tsx).
+ 
++### Model menu account selection
++
++Register `client.addModelAccountSource?.({ read, select, cancel })` when your plugin owns account selection for existing conversations. Return `null` from `read(agentId)` for agents outside your pool. The model menu reads the source on its own host while open. Use the account that confirmed the thread for `current` and the provider that created it for `origin`. Keep an unconfirmed destination in `pending`. Model choices and saved profiles use the original provider.
++
++Resolve `select` after the daemon accepts the choice. When the agent is busy, persist the selection and allow `cancel` until switching starts. A client can close or reconnect before the turn finishes. Return `canSwitch: false` and a reason when the host can only display the current account.
++
+ ## Contribute timeline items
+ 
+ Timeline transformers and renderers are client contributions. The daemon's canonical rows and
+diff --git a/packages/app/e2e/browser/plugin-buttons.spec.ts b/packages/app/e2e/browser/plugin-buttons.spec.ts
+index fe4227a8c..a30ae5dba 100644
+--- a/packages/app/e2e/browser/plugin-buttons.spec.ts
++++ b/packages/app/e2e/browser/plugin-buttons.spec.ts
+@@ -22,3 +22,10 @@ test("plugin tooltips and menu labels follow app language with a panel draft ope
+   test.setTimeout(180_000);
+   await verifyPluginToolTranslations(page, info);
+ });
++
++test("the model menu shows the confirmed account and supports switching and canceling", async ({
++  page,
++}, info) => {
++  test.setTimeout(180_000);
++  await withButtonShowcase(page, info, (buttons) => buttons.verifyModelAccounts());
++});
+diff --git a/packages/app/e2e/support/helpers/plugin-buttons.ts b/packages/app/e2e/support/helpers/plugin-buttons.ts
+index 2418f284d..0ebf551b4 100644
+--- a/packages/app/e2e/support/helpers/plugin-buttons.ts
++++ b/packages/app/e2e/support/helpers/plugin-buttons.ts
+@@ -61,7 +61,18 @@ function Details({ workspaceId, theme, layout, close }) {
+ export default function contribute(client) {
+   const workspaceId = ${JSON.stringify(workspaceId)};
+   const agentId = ${JSON.stringify(agentId)};
+-  const registrations = [];
++  const accounts = ["E", "F", "D"].map(label => ({id: label, label}));
++  let current = accounts[1], pending = null;
++  const account = client.addModelAccountSource({
++    async read(id) { return id === agentId ? { origin: accounts[0], current, accounts, pending } : null; },
++    async select(id, target) {
++      if (id !== agentId) throw Error("Wrong agent");
++      if (target === "D") pending = {accountId: target, phase: "queued"};
++      else { current = accounts.find(a => a.id === target); pending = null; }
++    },
++    async cancel(id) { if (id !== agentId) throw Error("Wrong agent"); pending = null; },
++  });
++  const registrations = [{ remove: account }];
+   let finish = () => {};
+   let finishReview = () => {};
+   let attempts = 0;
+@@ -280,6 +291,7 @@ export async function withButtonShowcase(
+     useCompactWorkspaceMenu(): Promise<void>;
+     hideAndUnloadOpenButtons(): Promise<void>;
+     verifyObservationLifetime(): Promise<void>;
++    verifyModelAccounts(): Promise<void>;
+   }) => Promise<void>,
+ ) {
+   const released = new Set<string>();
+@@ -308,6 +320,46 @@ export async function withButtonShowcase(
+     await expect(page.getByRole("button", { name: "Run review", exact: true })).toBeVisible();
+ 
+     await run({
++      async verifyModelAccounts() {
++        for (const [layout, viewport] of [
++          ["desktop", WIDE],
++          ["compact", COMPACT],
++        ] as const) {
++          await page.setViewportSize(viewport);
++          await page
++            .getByTestId("combined-model-selector")
++            .filter({ visible: true })
++            .first()
++            .click();
++          const title = page.getByTestId("model-account-trigger").filter({ visible: true }).first();
++          await expect(title).toHaveText(/Current account F · Original configuration E/);
++          await page.screenshot({ path: info.outputPath(layout + "-model-account.png") });
++          await title.click();
++          await page
++            .getByTestId("model-account-option-D")
++            .filter({ visible: true })
++            .first()
++            .click();
++          await expect(
++            page.getByText("Switch to D after this turn", { exact: true }),
++          ).toBeVisible();
++          await page.screenshot({ path: info.outputPath(layout + "-account-queue.png") });
++          await page.getByTestId("model-account-cancel").filter({ visible: true }).first().click();
++          await expect(page.getByTestId("model-account-cancel")).toHaveCount(0);
++          if (layout === "compact") {
++            await page
++              .getByTestId("model-account-option-E")
++              .filter({ visible: true })
++              .first()
++              .click();
++          }
++          await page.getByTestId("sheet-header-back").filter({ visible: true }).first().click();
++          await expect(title).toHaveText(
++            layout === "compact" ? "Current account E" : /Current account F/,
++          );
++          if (layout === "desktop") await page.keyboard.press("Escape");
++        }
++      },
+       verifyObservationLifetime: () =>
+         test.step("closing and crashing content release its owner while sibling buttons and app remain live", async () => {
+           await press(page, "Header status");
+diff --git a/packages/app/src/components/adaptive-modal-sheet.tsx b/packages/app/src/components/adaptive-modal-sheet.tsx
+index 4ddf872da..0a714c507 100644
+--- a/packages/app/src/components/adaptive-modal-sheet.tsx
++++ b/packages/app/src/components/adaptive-modal-sheet.tsx
+@@ -66,6 +66,7 @@ export interface SheetHeaderBack {
+ 
+ export interface SheetHeader {
+   title: string;
++  titleControl?: ReactNode;
+   subtitle?: ReactNode;
+   back?: SheetHeaderBack;
+   leading?: ReactNode;
+@@ -398,9 +399,11 @@ export function SheetHeaderView({
+         ) : null}
+         {header.leading ? <View style={styles.headerLeadingSlot}>{header.leading}</View> : null}
+         <View style={styles.headerTitleGroup}>
+-          <Text style={titleStyle} numberOfLines={1}>
+-            {header.title}
+-          </Text>
++          {header.titleControl ?? (
++            <Text style={titleStyle} numberOfLines={1}>
++              {header.title}
++            </Text>
++          )}
+           {header.subtitle}
+         </View>
+         {header.actions ? <View style={styles.headerActions}>{header.actions}</View> : null}
+@@ -465,9 +468,11 @@ export function InlineHeaderView({ header }: { header: SheetHeader }) {
+             </Pressable>
+           ) : null}
+           {header.leading ? <View style={styles.headerLeadingSlot}>{header.leading}</View> : null}
+-          <Text style={styles.inlineTitle} numberOfLines={1}>
+-            {header.title}
+-          </Text>
++          {header.titleControl ?? (
++            <Text style={styles.inlineTitle} numberOfLines={1}>
++              {header.title}
++            </Text>
++          )}
+           {header.actions ? <View style={styles.headerActions}>{header.actions}</View> : null}
+         </View>
+       ) : null}
+diff --git a/packages/app/src/components/combined-model-selector.tsx b/packages/app/src/components/combined-model-selector.tsx
+index 8473760c9..69f7ac537 100644
+--- a/packages/app/src/components/combined-model-selector.tsx
++++ b/packages/app/src/components/combined-model-selector.tsx
+@@ -9,6 +9,7 @@ import { LoadingSpinner } from "@/components/ui/loading-spinner";
+ import { Combobox, type ComboboxOption, type ComboboxProps } from "@/components/ui/combobox";
+ import { ModelBrowser, ModelProviderGlyph, useModelBrowser } from "@/components/model-browser";
+ import { resolveModelBrowserScrolling } from "@/components/model-browser-view";
++import { useModelAccountMenu } from "@/plugins/model-account-menu";
+ import { useIsCompactFormFactor } from "@/constants/layout";
+ import { isNative, isWeb } from "@/constants/platform";
+ import type { ProviderSelectorProvider } from "@/provider-selection/provider-selection";
+@@ -47,6 +48,7 @@ interface CombinedModelSelectorProps {
+   onRetryProvider?: (provider: AgentProvider) => void;
+   isRetryingProvider?: boolean;
+   disabled?: boolean;
++  agentId?: string;
+   serverId?: string | null;
+   desktopPlacement?: ComboboxProps["desktopPlacement"];
+   desktopMinWidth?: number;
+@@ -82,6 +84,7 @@ export function CombinedModelSelector({
+   onRetryProvider,
+   isRetryingProvider = false,
+   disabled = false,
++  agentId,
+   serverId = null,
+   desktopPlacement,
+   desktopMinWidth,
+@@ -102,6 +105,8 @@ export function CombinedModelSelector({
+     profiles,
+     serverId,
+   });
++  const accountMenu = useModelAccountMenu(serverId, agentId, isOpen, browser);
++  const { reset: resetAccountMenu } = accountMenu;
+   const { prepareToOpen, reset } = browser;
+ 
+   const handleOpenChange = useCallback(
+@@ -113,9 +118,10 @@ export function CombinedModelSelector({
+         return;
+       }
+       reset();
++      resetAccountMenu();
+       onClose?.();
+     },
+-    [onClose, onOpen, prepareToOpen, reset],
++    [onClose, onOpen, prepareToOpen, reset, resetAccountMenu],
+   );
+ 
+   const handleSelect = useCallback(
+@@ -277,11 +283,11 @@ export function CombinedModelSelector({
+         desktopLockWidth
+         desktopFixedHeight={browser.desktopFixedHeight}
+         desktopChildrenScrollEnabled={false}
+-        header={browser.header}
++        header={accountMenu.header(browser.header)}
+         mobileChildrenScrollEnabled={!browser.isProviderView || !isNative}
+         mobileChildrenContentContainerStyle={styles.mobileBrowserContent}
+       >
+-        {selectorBody}
++        {accountMenu.body ?? selectorBody}
+       </Combobox>
+     </>
+   );
+diff --git a/packages/app/src/composer/agent-controls/index.tsx b/packages/app/src/composer/agent-controls/index.tsx
+index 72795289c..26729dc51 100644
+--- a/packages/app/src/composer/agent-controls/index.tsx
++++ b/packages/app/src/composer/agent-controls/index.tsx
+@@ -129,6 +129,7 @@ interface ControlledAgentControlsProps {
+   onRetryModelProvider?: (provider: AgentProvider) => void;
+   isRetryingModelProvider?: boolean;
+   modeControl?: AgentModeControlValue | null;
++  modelSelectorAgentId?: string;
+   modelSelectorServerId?: string | null;
+   isCompactLayout?: boolean;
+ }
+@@ -500,6 +501,7 @@ function ControlledAgentControls({
+   onRetryModelProvider,
+   isRetryingModelProvider = false,
+   modeControl,
++  modelSelectorAgentId,
+   modelSelectorServerId = null,
+   isCompactLayout,
+ }: ControlledAgentControlsProps) {
+@@ -785,6 +787,7 @@ function ControlledAgentControls({
+             activeSheet={activeSheet}
+             handleOpenSheet={handleOpenSheet}
+             handleCloseSheet={handleCloseSheet}
++            modelSelectorAgentId={modelSelectorAgentId}
+             modelSelectorServerId={modelSelectorServerId}
+           />
+         ) : (
+@@ -821,6 +824,7 @@ function ControlledAgentControls({
+             renderThinkingOption={renderThinkingOption}
+             modeControl={modeControl}
+             glyphSize={layoutContextValue.glyphSize}
++            modelSelectorAgentId={modelSelectorAgentId}
+             modelSelectorServerId={modelSelectorServerId}
+             canSwitchProvider={Boolean(onSelectProviderAndModel)}
+           />
+@@ -885,6 +889,7 @@ interface DesktopAgentControlsContentProps {
+   activeSheet: ActiveSheet;
+   handleOpenSheet: (sheet: Exclude<ActiveSheet, null>) => void;
+   handleCloseSheet: () => void;
++  modelSelectorAgentId?: string;
+   modelSelectorServerId: string | null;
+ }
+ 
+@@ -942,6 +947,7 @@ function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
+     activeSheet,
+     handleOpenSheet,
+     handleCloseSheet,
++    modelSelectorAgentId,
+     modelSelectorServerId,
+   } = props;
+   const modelToolbar = useMemo(
+@@ -1002,6 +1008,7 @@ function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
+                 onClose={onDropdownClose}
+                 onRetryProvider={onRetryModelProvider}
+                 isRetryingProvider={isRetryingModelProvider}
++                agentId={modelSelectorAgentId}
+                 serverId={modelSelectorServerId}
+                 desktopPlacement="top-start"
+                 desktopMinWidth={360}
+@@ -1144,6 +1151,7 @@ interface SheetAgentControlsContentProps {
+   }) => ReactElement;
+   modeControl?: AgentModeControlValue | null;
+   glyphSize: number;
++  modelSelectorAgentId?: string;
+   modelSelectorServerId: string | null;
+   canSwitchProvider: boolean;
+ }
+@@ -1183,6 +1191,7 @@ function SheetAgentControlsContent(props: SheetAgentControlsContentProps) {
+     renderThinkingOption,
+     modeControl,
+     glyphSize,
++    modelSelectorAgentId,
+     modelSelectorServerId,
+     canSwitchProvider,
+   } = props;
+@@ -1269,6 +1278,7 @@ function SheetAgentControlsContent(props: SheetAgentControlsContentProps) {
+       onClose={onDropdownClose}
+       onRetryProvider={onRetryModelProvider}
+       isRetryingProvider={isRetryingModelProvider}
++      agentId={modelSelectorAgentId}
+       serverId={modelSelectorServerId}
+       glyphSize={glyphSize}
+       canSwitchProvider={canSwitchProvider}
+@@ -1816,6 +1826,7 @@ export const AgentControls = memo(function AgentControls({
+         onDropdownClose={onDropdownClose}
+         disabled={!client}
+         modeControl={modeControl}
++        modelSelectorAgentId={agentId}
+         modelSelectorServerId={serverId}
+         isCompactLayout={isCompactLayout}
+       />
+diff --git a/packages/app/src/composer/agent-controls/model-sheet.tsx b/packages/app/src/composer/agent-controls/model-sheet.tsx
+index 6929b447e..e73b5f07e 100644
+--- a/packages/app/src/composer/agent-controls/model-sheet.tsx
++++ b/packages/app/src/composer/agent-controls/model-sheet.tsx
+@@ -13,6 +13,7 @@ import { AgentControlTrigger } from "@/composer/agent-controls/control";
+ import { ComposerToolbarGlyph } from "@/composer/agent-controls/glyph";
+ import { resolveModelSheetOpening } from "@/composer/agent-controls/model-sheet-flow";
+ import type { ProviderSelectorProvider } from "@/provider-selection/provider-selection";
++import { useModelAccountMenu } from "@/plugins/model-account-menu";
+ import { useIsCompactFormFactor } from "@/constants/layout";
+ import { isNative, isWeb } from "@/constants/platform";
+ 
+@@ -40,6 +41,7 @@ interface CompactModelSheetProps {
+   onRetryProvider?: (provider: AgentProvider) => void;
+   isRetryingProvider?: boolean;
+   disabled?: boolean;
++  agentId?: string;
+   serverId?: string | null;
+   glyphSize: number;
+   canSwitchProvider: boolean;
+@@ -92,6 +94,7 @@ export function CompactModelSheet({
+   onRetryProvider,
+   isRetryingProvider = false,
+   disabled = false,
++  agentId,
+   serverId = null,
+   glyphSize,
+   canSwitchProvider,
+@@ -129,6 +132,20 @@ export function CompactModelSheet({
+     profiles,
+     serverId,
+   });
++  const accountMenu = useModelAccountMenu(
++    serverId,
++    agentId,
++    isOpen && !isModelBrowserOpen,
++    rootBrowser,
++  );
++  const browserAccountMenu = useModelAccountMenu(
++    serverId,
++    agentId,
++    isModelBrowserOpen,
++    modelBrowser,
++  );
++  const { reset: resetAccountMenu } = accountMenu;
++  const { reset: resetBrowserAccountMenu } = browserAccountMenu;
+   const ModelIcon = useProviderIcon(selectedProvider, serverId);
+   const hasSelectedProvider = selectedProvider.trim().length > 0;
+   const rootHeader = useMemo(
+@@ -158,8 +175,10 @@ export function CompactModelSheet({
+     setIsOpen(false);
+     rootBrowser.reset();
+     modelBrowser.reset();
++    resetAccountMenu();
++    resetBrowserAccountMenu();
+     onClose?.();
+-  }, [modelBrowser, onClose, rootBrowser]);
++  }, [modelBrowser, onClose, rootBrowser, resetAccountMenu, resetBrowserAccountMenu]);
+ 
+   const handleSearchSelect = useCallback(
+     (provider: string, modelId: string) => {
+@@ -188,7 +207,8 @@ export function CompactModelSheet({
+   const closeModelBrowser = useCallback(() => {
+     setIsModelBrowserOpen(false);
+     modelBrowser.reset();
+-  }, [modelBrowser]);
++    resetBrowserAccountMenu();
++  }, [modelBrowser, resetBrowserAccountMenu]);
+ 
+   const handleBrowserSelect = useCallback(
+     (provider: string, modelId: string) => {
+@@ -293,7 +313,7 @@ export function CompactModelSheet({
+       </ComboboxTrigger>
+ 
+       <AdaptiveModalSheet
+-        header={rootHeader}
++        header={accountMenu.header(rootHeader)}
+         visible={isOpen}
+         onClose={close}
+         snapPoints={SNAP_POINTS}
+@@ -308,19 +328,21 @@ export function CompactModelSheet({
+           ]}
+           testID="agent-controls-model-viewport"
+         >
+-          <ModelBrowser
+-            state={rootBrowser}
+-            onSelect={usesBottomSheet ? handleSearchSelect : handleDesktopSelect}
+-            onApplyProfile={handleApplyProfile}
+-            onEditProfiles={onEditProfiles ? handleEditProfiles : undefined}
+-            onCreateProfile={profileActions.create}
+-            onEditProfile={profileActions.edit}
+-            onRetryProvider={onRetryProvider}
+-            isRetryingProvider={isRetryingProvider}
+-            scrolling={modelBrowserScrolling}
+-            searchAllOnFocus={usesBottomSheet}
+-            rootBrowseContent={usesBottomSheet ? mobileRootContent : undefined}
+-          />
++          {accountMenu.body ?? (
++            <ModelBrowser
++              state={rootBrowser}
++              onSelect={usesBottomSheet ? handleSearchSelect : handleDesktopSelect}
++              onApplyProfile={handleApplyProfile}
++              onEditProfiles={onEditProfiles ? handleEditProfiles : undefined}
++              onCreateProfile={profileActions.create}
++              onEditProfile={profileActions.edit}
++              onRetryProvider={onRetryProvider}
++              isRetryingProvider={isRetryingProvider}
++              scrolling={modelBrowserScrolling}
++              searchAllOnFocus={usesBottomSheet}
++              rootBrowseContent={usesBottomSheet ? mobileRootContent : undefined}
++            />
++          )}
+         </View>
+         {!usesBottomSheet ? (
+           <>
+@@ -340,7 +362,7 @@ export function CompactModelSheet({
+ 
+       {usesBottomSheet ? (
+         <AdaptiveModalSheet
+-          header={modelBrowser.header}
++          header={browserAccountMenu.header(modelBrowser.header)}
+           visible={isModelBrowserOpen}
+           onClose={closeModelBrowser}
+           snapPoints={SNAP_POINTS}
+@@ -353,18 +375,20 @@ export function CompactModelSheet({
+             style={[styles.modelViewport, styles.flexibleModelViewport]}
+             testID="agent-controls-model-browser-viewport"
+           >
+-            <ModelBrowser
+-              state={modelBrowser}
+-              onSelect={handleBrowserSelect}
+-              onEditProfiles={onEditProfiles ? handleEditProfiles : undefined}
+-              onCreateProfile={profileActions.create}
+-              onEditProfile={profileActions.edit}
+-              onRetryProvider={onRetryProvider}
+-              isRetryingProvider={isRetryingProvider}
+-              scrolling={modelBrowserScrolling}
+-              searchAllOnFocus
+-              showProfilesSection={false}
+-            />
++            {browserAccountMenu.body ?? (
++              <ModelBrowser
++                state={modelBrowser}
++                onSelect={handleBrowserSelect}
++                onEditProfiles={onEditProfiles ? handleEditProfiles : undefined}
++                onCreateProfile={profileActions.create}
++                onEditProfile={profileActions.edit}
++                onRetryProvider={onRetryProvider}
++                isRetryingProvider={isRetryingProvider}
++                scrolling={modelBrowserScrolling}
++                searchAllOnFocus
++                showProfilesSection={false}
++              />
++            )}
+           </View>
+         </AdaptiveModalSheet>
+       ) : null}
+diff --git a/packages/app/src/i18n/resources/ar.ts b/packages/app/src/i18n/resources/ar.ts
+index 8d7c2a295..9a0d0fd0f 100644
+--- a/packages/app/src/i18n/resources/ar.ts
++++ b/packages/app/src/i18n/resources/ar.ts
+@@ -1648,6 +1648,14 @@ export const ar: TranslationResources = {
+     },
+   },
+   modelSelector: {
++    currentAccount: "الحساب الحالي {{account}}",
++    accountAndOrigin: "الحساب الحالي {{account}} · الإعداد الأصلي {{origin}}",
++    accountUnconfirmed: "غير مؤكد",
++    switchAccount: "تبديل الحساب",
++    chooseAccount: "{{title}}. تبديل الحساب",
++    accountQueued: "التبديل إلى {{account}} بعد انتهاء هذه الجولة",
++    accountSwitching: "جارٍ التبديل إلى {{account}}…",
++    cancelAccountSwitch: "إلغاء التبديل المجدول",
+     title: "حدد المزود",
+     selectModel: "حدد النموذج",
+     selectedModel: "اختر الموديل ({{model}})",
+diff --git a/packages/app/src/i18n/resources/en.ts b/packages/app/src/i18n/resources/en.ts
+index 1f61a83f1..cb12797e4 100644
+--- a/packages/app/src/i18n/resources/en.ts
++++ b/packages/app/src/i18n/resources/en.ts
+@@ -1673,6 +1673,14 @@ export const en = {
+     },
+   },
+   modelSelector: {
++    currentAccount: "Current account {{account}}",
++    accountAndOrigin: "Current account {{account}} · Original configuration {{origin}}",
++    accountUnconfirmed: "unconfirmed",
++    switchAccount: "Switch account",
++    chooseAccount: "{{title}}. Switch account",
++    accountQueued: "Switch to {{account}} after this turn",
++    accountSwitching: "Switching to {{account}}…",
++    cancelAccountSwitch: "Cancel scheduled switch",
+     title: "Select provider",
+     selectModel: "Select model",
+     selectedModel: "Select model ({{model}})",
+diff --git a/packages/app/src/i18n/resources/es.ts b/packages/app/src/i18n/resources/es.ts
+index 7e5a1d41e..91df62771 100644
+--- a/packages/app/src/i18n/resources/es.ts
++++ b/packages/app/src/i18n/resources/es.ts
+@@ -1694,6 +1694,14 @@ export const es: TranslationResources = {
+     },
+   },
+   modelSelector: {
++    currentAccount: "Cuenta actual {{account}}",
++    accountAndOrigin: "Cuenta actual {{account}} · Configuración original {{origin}}",
++    accountUnconfirmed: "sin confirmar",
++    switchAccount: "Cambiar de cuenta",
++    chooseAccount: "{{title}}. Cambiar de cuenta",
++    accountQueued: "Cambiar a {{account}} al terminar este turno",
++    accountSwitching: "Cambiando a {{account}}…",
++    cancelAccountSwitch: "Cancelar el cambio programado",
+     title: "Seleccionar proveedor",
+     selectModel: "Seleccionar modelo",
+     selectedModel: "Seleccionar modelo ({{model}})",
+diff --git a/packages/app/src/i18n/resources/fr.ts b/packages/app/src/i18n/resources/fr.ts
+index 551f4a415..f86ccad0c 100644
+--- a/packages/app/src/i18n/resources/fr.ts
++++ b/packages/app/src/i18n/resources/fr.ts
+@@ -1692,6 +1692,14 @@ export const fr: TranslationResources = {
+     },
+   },
+   modelSelector: {
++    currentAccount: "Compte actuel {{account}}",
++    accountAndOrigin: "Compte actuel {{account}} · Configuration d’origine {{origin}}",
++    accountUnconfirmed: "non confirmé",
++    switchAccount: "Changer de compte",
++    chooseAccount: "{{title}}. Changer de compte",
++    accountQueued: "Passage à {{account}} à la fin de ce tour",
++    accountSwitching: "Passage à {{account}}…",
++    cancelAccountSwitch: "Annuler le changement prévu",
+     title: "Sélectionner le fournisseur",
+     selectModel: "Sélectionner le modèle",
+     selectedModel: "Sélectionner le modèle ({{model}})",
+diff --git a/packages/app/src/i18n/resources/ja.ts b/packages/app/src/i18n/resources/ja.ts
+index 4b1b8b6f6..b42556d91 100644
+--- a/packages/app/src/i18n/resources/ja.ts
++++ b/packages/app/src/i18n/resources/ja.ts
+@@ -1665,6 +1665,14 @@ export const ja: TranslationResources = {
+     },
+   },
+   modelSelector: {
++    currentAccount: "現在のアカウント {{account}}",
++    accountAndOrigin: "現在のアカウント {{account}} · 元の設定 {{origin}}",
++    accountUnconfirmed: "未確認",
++    switchAccount: "アカウントを切り替え",
++    chooseAccount: "{{title}}。アカウントを切り替え",
++    accountQueued: "このターンの終了後に {{account}} に切り替えます",
++    accountSwitching: "{{account}} に切り替え中…",
++    cancelAccountSwitch: "切り替え予約を取り消す",
+     title: "プロバイダーを選択",
+     selectModel: "モデルを選択",
+     selectedModel: "モデルを選択（{{model}}）",
+diff --git a/packages/app/src/i18n/resources/ko.ts b/packages/app/src/i18n/resources/ko.ts
+index b9e33b4eb..1e4717d1e 100644
+--- a/packages/app/src/i18n/resources/ko.ts
++++ b/packages/app/src/i18n/resources/ko.ts
+@@ -1658,6 +1658,14 @@ export const ko: TranslationResources = {
+     },
+   },
+   modelSelector: {
++    currentAccount: "현재 계정 {{account}}",
++    accountAndOrigin: "현재 계정 {{account}} · 원래 설정 {{origin}}",
++    accountUnconfirmed: "미확인",
++    switchAccount: "계정 전환",
++    chooseAccount: "{{title}}. 계정 전환",
++    accountQueued: "이번 턴이 끝나면 {{account}} 계정으로 전환",
++    accountSwitching: "{{account}} 계정으로 전환 중…",
++    cancelAccountSwitch: "예약된 전환 취소",
+     title: "프로바이더 선택",
+     selectModel: "모델 선택",
+     selectedModel: "모델 선택 ({{model}})",
+diff --git a/packages/app/src/i18n/resources/pt-BR.ts b/packages/app/src/i18n/resources/pt-BR.ts
+index 2fa6c30c8..5c5ca655c 100644
+--- a/packages/app/src/i18n/resources/pt-BR.ts
++++ b/packages/app/src/i18n/resources/pt-BR.ts
+@@ -1679,6 +1679,14 @@ export const ptBR: TranslationResources = {
+     },
+   },
+   modelSelector: {
++    currentAccount: "Conta atual {{account}}",
++    accountAndOrigin: "Conta atual {{account}} · Configuração original {{origin}}",
++    accountUnconfirmed: "não confirmada",
++    switchAccount: "Trocar conta",
++    chooseAccount: "{{title}}. Trocar conta",
++    accountQueued: "Trocar para {{account}} após este turno",
++    accountSwitching: "Trocando para {{account}}…",
++    cancelAccountSwitch: "Cancelar troca agendada",
+     title: "Selecionar provedor",
+     selectModel: "Selecionar modelo",
+     selectedModel: "Selecionar modelo ({{model}})",
+diff --git a/packages/app/src/i18n/resources/ru.ts b/packages/app/src/i18n/resources/ru.ts
+index 9a6eb5b0e..82cf2ed56 100644
+--- a/packages/app/src/i18n/resources/ru.ts
++++ b/packages/app/src/i18n/resources/ru.ts
+@@ -1677,6 +1677,14 @@ export const ru: TranslationResources = {
+     },
+   },
+   modelSelector: {
++    currentAccount: "Текущий аккаунт {{account}}",
++    accountAndOrigin: "Текущий аккаунт {{account}} · Исходная конфигурация {{origin}}",
++    accountUnconfirmed: "не подтверждён",
++    switchAccount: "Сменить аккаунт",
++    chooseAccount: "{{title}}. Сменить аккаунт",
++    accountQueued: "Переключение на {{account}} после текущего хода",
++    accountSwitching: "Переключение на {{account}}…",
++    cancelAccountSwitch: "Отменить запланированное переключение",
+     title: "Выберите провайдера",
+     selectModel: "Выберите модель",
+     selectedModel: "Выберите модель ({{model}})",
+diff --git a/packages/app/src/i18n/resources/zh-CN.ts b/packages/app/src/i18n/resources/zh-CN.ts
+index 553d8212b..97a02dc52 100644
+--- a/packages/app/src/i18n/resources/zh-CN.ts
++++ b/packages/app/src/i18n/resources/zh-CN.ts
+@@ -1631,6 +1631,14 @@ export const zhCN: TranslationResources = {
+     },
+   },
+   modelSelector: {
++    currentAccount: "当前账号 {{account}}",
++    accountAndOrigin: "当前账号 {{account}} · 原始配置 {{origin}}",
++    accountUnconfirmed: "待确认",
++    switchAccount: "切换账号",
++    chooseAccount: "{{title}}，切换账号",
++    accountQueued: "本轮结束后切换到 {{account}}",
++    accountSwitching: "正在切换到 {{account}}…",
++    cancelAccountSwitch: "撤销本次切换",
+     title: "选择 provider",
+     selectModel: "选择模型",
+     selectedModel: "选择模型（{{model}}）",
+diff --git a/packages/app/src/plugins/evaluate.test.ts b/packages/app/src/plugins/evaluate.test.ts
+index 1aae11f63..95bbc3860 100644
+--- a/packages/app/src/plugins/evaluate.test.ts
++++ b/packages/app/src/plugins/evaluate.test.ts
+@@ -30,6 +30,23 @@ function bundle(body: string): string {
+ }
+ 
+ describe("evaluatePluginClientBundle", () => {
++  it("registers and removes the installation's model menu account source", async () => {
++    const plugin = evaluatePluginClientBundle(
++      "accounts",
++      bundle(`
++      plugin.addModelAccountSource({ async read(id) { return id === "agent" ? {
++        origin: { id: "e", label: "E" }, current: {id:"f", label:"F"}, accounts: [], pending: null
++      } : null; }, async select() {}, async cancel() {} });`),
++    );
++    const [entry] = plugin.modelAccountSources ?? [];
++    expect(await entry.source.read("agent")).toMatchObject({
++      current: { id: "f" },
++      origin: { id: "e" },
++    });
++    expect(await entry.source.read("other")).toBeNull();
++    await plugin.cleanup();
++    expect(plugin.modelAccountSources).toEqual([]);
++  });
+   it("releases button registrations when client setup throws", () => {
+     let active = 0;
+     function addButton() {
+diff --git a/packages/app/src/plugins/evaluate.ts b/packages/app/src/plugins/evaluate.ts
+index ea37209f5..82c6c2e7b 100644
+--- a/packages/app/src/plugins/evaluate.ts
++++ b/packages/app/src/plugins/evaluate.ts
+@@ -25,6 +25,7 @@ import {
+   type PluginTimelineRendererContribution,
+   type PluginTimelineTransformerContribution,
+   type PluginButtonRegistration,
++  type PluginModelAccountSource,
+ } from "@getpaseo/plugin/client";
+ import type {
+   EvaluatedPlugin,
+@@ -42,6 +43,7 @@ import type { ComponentType } from "react";
+ import { parsePluginIcon, parseSerializablePluginIcon } from "./icons";
+ import { parsePluginThemeContribution } from "./themes";
+ 
++let nextAccountSourceKey = 0;
+ const CONTRIBUTION_ID = /^[a-z][a-z0-9-]*$/;
+ const PANEL_LOCATIONS = ["workspace", "explorer"] as const;
+ const TIMELINE_ITEM_TYPES = new Set([
+@@ -139,6 +141,7 @@ export function runPluginClientBundle(
+     timelineTransformers: [],
+     timelineRenderers: [],
+   };
++  const modelAccountSources: { key: number; source: PluginModelAccountSource }[] = [];
+   const surfaceIds = new Set<string>();
+   const settingsScreenIds = new Set<string>();
+   const sidebarItemIds: Record<PluginSidebarSection, Set<string>> = {
+@@ -497,6 +500,18 @@ export function runPluginClientBundle(
+         timelineRendererIds.delete(rendererId),
+       );
+     },
++    addModelAccountSource(source) {
++      if (stopped) throw new Error("Plugin has stopped");
++      if (modelAccountSources.length)
++        throw new Error("Plugin already registered a model account source");
++      if (
++        !source ||
++        [source.read, source.select, source.cancel].some((method) => typeof method !== "function")
++      ) {
++        throw new Error("Invalid model account source");
++      }
++      return register(modelAccountSources, { key: ++nextAccountSourceKey, source }, () => {});
++    },
+     addComposerPill(contribution) {
+       if (stopped) throw new Error("Plugin has stopped");
+       return trackButton(runtime.addComposerPill(contribution));
+@@ -589,6 +604,7 @@ export function runPluginClientBundle(
+     commandCenterItems: collector.commandCenterItems,
+     clientSlashCommands: collector.clientSlashCommands,
+     attachmentSources: collector.attachmentSources,
++    modelAccountSources,
+     themes: collector.themes,
+     timelineTransformers: collector.timelineTransformers,
+     timelineRenderers: collector.timelineRenderers,
+diff --git a/packages/app/src/plugins/model-account-menu.tsx b/packages/app/src/plugins/model-account-menu.tsx
+new file mode 100644
+index 000000000..4b860d089
+--- /dev/null
++++ b/packages/app/src/plugins/model-account-menu.tsx
+@@ -0,0 +1,244 @@
++import { useCallback, useMemo, useRef, useState } from "react";
++import { ScrollView, Text } from "react-native";
++import { useTranslation } from "react-i18next";
++import { ChevronDown } from "lucide-react-native";
++import { StyleSheet } from "react-native-unistyles";
++import type {
++  PluginModelAccount,
++  PluginModelAccountSource,
++  PluginModelAccountState,
++} from "@getpaseo/plugin/client";
++import type { ModelBrowserState } from "@/components/model-browser";
++import type { SheetHeader } from "@/components/adaptive-modal-sheet";
++import { PressHighlight } from "@/components/ui/press-highlight";
++import { ComboboxItem } from "@/components/ui/combobox";
++import { useFetchQueries } from "@/data/query";
++import { useInstalledPlugins } from "./registry";
++
++export function useModelAccountMenu(
++  serverId: string | null,
++  agentId: string | undefined,
++  visible: boolean,
++  {
++    view,
++    selectedProvider,
++    providers,
++  }: Pick<ModelBrowserState, "view" | "selectedProvider" | "providers">,
++) {
++  const { t } = useTranslation();
++  const plugins = useInstalledPlugins();
++  const onCurrentProvider = view.kind === "all" || view.providerId === selectedProvider;
++  const sources = useMemo(
++    () =>
++      visible && onCurrentProvider && agentId
++        ? plugins
++            .filter((plugin) => plugin.serverId === serverId)
++            .flatMap((plugin) => plugin.modelAccountSources ?? [])
++        : [],
++    [plugins, serverId, agentId, visible, onCurrentProvider],
++  );
++  const queries = useFetchQueries<PluginModelAccountState | null>(
++    sources.map(({ key, source }) => ({
++      queryKey: ["model-account", serverId, agentId, key],
++      queryFn: () => source.read(agentId!),
++      dataShape: "value",
++      staleTimeMs: 0,
++      gcTime: 0,
++      retry: false,
++      refetchInterval: (query) => (query.state.data?.pending ? 1200 : 5000),
++    })),
++  );
++  const index = queries.findIndex((query) => query.data != null);
++  const query = queries[index];
++  const state = query?.data;
++  const registration = sources[index];
++  const owner = registration && agentId ? JSON.stringify([registration.key, agentId]) : null;
++  const [page, setPage] = useState<string | null>(null);
++  const reset = useCallback(() => setPage(null), []);
++  const openAccounts = useCallback(() => setPage(owner), [owner]);
++
++  if (!state || !registration || !owner || !agentId) {
++    const unresolved = queries.some((entry) => entry.isError || entry.isPending);
++    const origin =
++      providers.find((entry) => entry.id === selectedProvider)?.label ?? selectedProvider;
++    const header = (base: SheetHeader): SheetHeader =>
++      unresolved
++        ? {
++            ...base,
++            title: t("modelSelector.accountAndOrigin", {
++              account: t("modelSelector.accountUnconfirmed"),
++              origin,
++            }),
++          }
++        : base;
++    return { header, body: null, reset };
++  }
++  const current = query.isError ? null : state.current;
++  const title =
++    current?.id === state.origin.id
++      ? t("modelSelector.currentAccount", { account: current.label })
++      : t("modelSelector.accountAndOrigin", {
++          account: current?.label ?? t("modelSelector.accountUnconfirmed"),
++          origin: state.origin.label,
++        });
++  const choosing = page === owner;
++  const header = (base: SheetHeader): SheetHeader =>
++    choosing
++      ? { title: t("modelSelector.switchAccount"), back: { onPress: reset } }
++      : {
++          ...base,
++          title,
++          titleControl: (
++            <PressHighlight
++              accessibilityRole="button"
++              accessibilityLabel={t("modelSelector.chooseAccount", { title })}
++              testID="model-account-trigger"
++              onPress={openAccounts}
++              style={styles.trigger}
++            >
++              <Text style={styles.title} numberOfLines={2}>
++                {title}
++              </Text>
++              <ChevronDown size={14} color={styles.icon.color} />
++            </PressHighlight>
++          ),
++        };
++  const body = choosing ? (
++    <AccountOptions
++      key={owner}
++      agentId={agentId}
++      source={registration.source}
++      state={state}
++      readError={query.error?.message}
++      refresh={query.refetch}
++    />
++  ) : null;
++  return { header, body, reset };
++}
++
++function AccountOptions({
++  agentId,
++  source,
++  state,
++  readError,
++  refresh,
++}: {
++  agentId: string;
++  source: PluginModelAccountSource;
++  state: PluginModelAccountState;
++  readError?: string;
++  refresh: () => Promise<unknown>;
++}) {
++  const { t } = useTranslation();
++  const [working, setWorking] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const locked = useRef(false);
++  const busy = working || state.canSwitch === false || Boolean(readError);
++  const change = useCallback(
++    async (target: string | null) => {
++      if (locked.current || busy) return;
++      locked.current = true;
++      setWorking(true);
++      setError(null);
++      try {
++        if (target === null) await source.cancel(agentId);
++        else await source.select(agentId, target);
++      } catch (cause) {
++        setError(cause instanceof Error ? cause.message : String(cause));
++      } finally {
++        try {
++          await refresh();
++        } finally {
++          locked.current = false;
++          setWorking(false);
++        }
++      }
++    },
++    [agentId, source, refresh, busy],
++  );
++  const cancel = useCallback(() => void change(null), [change]);
++  const pending = state.pending;
++  const errorText = error ?? readError ?? state.error;
++  return (
++    <ScrollView keyboardShouldPersistTaps="handled" testID="model-account-options">
++      {pending ? (
++        <Text accessibilityLiveRegion="polite" style={styles.notice}>
++          {t(
++            pending.phase === "queued"
++              ? "modelSelector.accountQueued"
++              : "modelSelector.accountSwitching",
++            {
++              account:
++                state.accounts.find((a) => a.id === pending.accountId)?.label ?? pending.accountId,
++            },
++          )}
++        </Text>
++      ) : null}
++      {errorText ? (
++        <Text accessibilityRole="alert" style={styles.error}>
++          {errorText}
++        </Text>
++      ) : null}
++      {state.accounts.map((account) => (
++        <AccountOption
++          key={account.id}
++          account={account}
++          change={change}
++          selected={!readError && account.id === state.current?.id}
++          disabled={busy || pending?.phase === "switching" || account.id === pending?.accountId}
++        />
++      ))}
++      {pending?.phase === "queued" ? (
++        <ComboboxItem
++          label={t("modelSelector.cancelAccountSwitch")}
++          testID="model-account-cancel"
++          disabled={busy}
++          onPress={cancel}
++        />
++      ) : null}
++    </ScrollView>
++  );
++}
++
++function AccountOption({
++  account,
++  selected,
++  disabled,
++  change,
++}: {
++  account: PluginModelAccount;
++  selected: boolean;
++  disabled: boolean;
++  change: (id: string) => Promise<void>;
++}) {
++  const press = useCallback(() => void change(account.id), [change, account.id]);
++  return (
++    <ComboboxItem
++      testID={`model-account-option-${account.id}`}
++      label={account.label}
++      selected={selected}
++      disabled={selected || disabled}
++      onPress={press}
++    />
++  );
++}
++
++const styles = StyleSheet.create((theme) => ({
++  trigger: {
++    flex: 1,
++    minWidth: 0,
++    flexDirection: "row",
++    alignItems: "center",
++    gap: theme.spacing[1],
++    minHeight: 32,
++  },
++  title: {
++    flexShrink: 1,
++    color: theme.colors.foreground,
++    fontSize: theme.fontSize.base,
++    fontWeight: theme.fontWeight.semibold,
++  },
++  icon: { color: theme.colors.foregroundMuted },
++  notice: { padding: theme.spacing[3], color: theme.colors.foregroundMuted },
++  error: { padding: theme.spacing[3], color: theme.colors.statusDanger },
++}));
+diff --git a/packages/app/src/plugins/types.ts b/packages/app/src/plugins/types.ts
+index 9c2a88a21..111f81cb4 100644
+--- a/packages/app/src/plugins/types.ts
++++ b/packages/app/src/plugins/types.ts
+@@ -16,6 +16,7 @@ import type {
+   PluginSidebarItemContribution as SDKPluginSidebarItemContribution,
+   PluginScreenContribution as SDKPluginScreenContribution,
+   PluginSettingsScreenContribution as SDKPluginSettingsScreenContribution,
++  PluginModelAccountSource,
+   PluginTimelineRendererContribution,
+   PluginTimelineTransformerContribution,
+   PluginPanelLocation,
+@@ -57,6 +58,7 @@ export interface EvaluatedPlugin {
+   commandCenterItems: PluginCommandCenterItemContribution[];
+   clientSlashCommands: PluginClientSlashCommandContribution[];
+   attachmentSources: PluginAttachmentSourceContribution[];
++  modelAccountSources?: { key: number; source: PluginModelAccountSource }[];
+   themes: PluginThemeContribution[];
+   timelineTransformers: PluginTimelineTransformerContribution[];
+   timelineRenderers: PluginTimelineRendererContribution[];
+diff --git a/packages/plugin/src/client/contracts.ts b/packages/plugin/src/client/contracts.ts
+index 7675a655f..bd2ddbf8c 100644
+--- a/packages/plugin/src/client/contracts.ts
++++ b/packages/plugin/src/client/contracts.ts
+@@ -173,6 +173,27 @@ interface PluginClientContextAliases {
+   addSidebarItem(contribution: PluginSidebarContribution<PluginText>): PluginCleanup;
+ }
+ 
++export interface PluginModelAccount {
++  id: string;
++  label: string;
++}
++
++export interface PluginModelAccountState {
++  origin: PluginModelAccount;
++  current: PluginModelAccount | null;
++  canSwitch?: boolean;
++  accounts: PluginModelAccount[];
++  pending: { accountId: string; phase: "queued" | "switching" } | null;
++  error?: string | null;
++}
++
++export interface PluginModelAccountSource {
++  /** Return null for an agent outside this source. Only a confirmed account belongs in current. */
++  read(agentId: string): Promise<PluginModelAccountState | null>;
++  select(agentId: string, accountId: string): Promise<void>;
++  cancel(agentId: string): Promise<void>;
++}
++
+ export interface PluginClientContext extends PluginCommandCapabilities, PluginClientContextAliases {
+   readonly i18n: import("./translations.js").PluginI18n;
+   /** Play a base64-encoded audio file on this client; resolves when playback ends. */
+@@ -196,6 +217,7 @@ export interface PluginClientContext extends PluginCommandCapabilities, PluginCl
+   addAttachmentSource(contribution: PluginAttachmentSourceContribution<PluginText>): PluginCleanup;
+   addTheme(contribution: PluginThemeContribution<PluginText>): PluginCleanup;
+   addFilePanel(contribution: PluginFilePanelContribution<PluginText>): PluginCleanup;
++  addModelAccountSource?(source: PluginModelAccountSource): PluginCleanup;
+   addTimelineTransformer<ItemType extends AgentTimelineItem["type"]>(
+     contribution: PluginTimelineTransformerContribution<ItemType>,
+   ): PluginCleanup;
+diff --git a/packages/plugin/src/client/index.ts b/packages/plugin/src/client/index.ts
+index 62cf7e2dc..18fe27e57 100644
+--- a/packages/plugin/src/client/index.ts
++++ b/packages/plugin/src/client/index.ts
+@@ -8,6 +8,9 @@ export type {
+   PluginAgentPanelContribution,
+   PluginFilePanelContribution,
+   PluginFilePanelProps,
++  PluginModelAccount,
++  PluginModelAccountSource,
++  PluginModelAccountState,
+   PluginSurfaceProps,
+   PluginScreenProps,
+   PluginPopoverProps,
+diff --git a/packages/plugin/src/server/lifecycle.ts b/packages/plugin/src/server/lifecycle.ts
+index 20df9c2dc..25d9c7a56 100644
+--- a/packages/plugin/src/server/lifecycle.ts
++++ b/packages/plugin/src/server/lifecycle.ts
+@@ -76,6 +76,8 @@ export interface PluginSessionOpenRequest {
+   provider: string;
+   cwd: string;
+   reason: "create" | "resume" | "refresh" | "import";
++  /** Correlates a guarded refresh with the caller that requested this launch. */
++  reloadRequestId?: string;
+   purpose: "interactive" | "history";
+   readonly title: string | null;
+   readonly labels: Readonly<Record<string, string>>;
+diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
+index 18654bf33..2884d9744 100644
+--- a/packages/protocol/src/messages.ts
++++ b/packages/protocol/src/messages.ts
+@@ -1896,6 +1896,21 @@ export const RefreshAgentRequestMessageSchema = z.object({
+   requestId: z.string(),
+ });
+ 
++const ReloadAgentIfIdleRequestSchema = z.object({
++  type: z.literal("agent.session.reload_if_idle.request"),
++  agentId: z.string(),
++  requestId: z.string(),
++});
++
++const ReloadAgentIfIdleResponseSchema = z.object({
++  type: z.literal("agent.session.reload_if_idle.response"),
++  payload: z.object({
++    agentId: z.string(),
++    requestId: z.string(),
++    outcome: z.enum(["reloaded", "busy"]),
++  }),
++});
++
+ export const CancelAgentRequestMessageSchema = z.object({
+   type: z.literal("cancel_agent_request"),
+   agentId: z.string(),
+@@ -3366,6 +3381,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
+   ResumeAgentRequestMessageSchema,
+   ImportAgentRequestMessageSchema,
+   RefreshAgentRequestMessageSchema,
++  ReloadAgentIfIdleRequestSchema,
+   CancelAgentRequestMessageSchema,
+   ShutdownServerRequestMessageSchema,
+   RestartServerRequestMessageSchema,
+@@ -3779,6 +3795,8 @@ export const ServerInfoStatusPayloadSchema = z
+         providerUsageList: z.boolean().optional(),
+         // COMPAT(agentDetach): added in v0.1.98, remove gate after 2026-12-19 once daemon floor >= v0.1.98.
+         agentDetach: z.boolean().optional(),
++        // COMPAT(agentReloadIfIdle): added in v0.15.1 (local build), remove the gate after 2027-05-24 once the daemon floor supports guarded reload.
++        agentReloadIfIdle: z.boolean().optional(),
+         // COMPAT(agentThinkingUpdate): added in v0.2.4, remove gate after 2027-01-28.
+         agentThinkingUpdate: z.boolean().optional(),
+         // COMPAT(daemonDiagnostics): added in v0.1.100, remove gate after 2026-12-25 once daemon floor >= v0.1.100.
+@@ -7130,6 +7148,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
+   AgentConfigApplyResponseMessageSchema,
+   AgentDetachResponseMessageSchema,
+   AgentRewindResponseMessageSchema,
++  ReloadAgentIfIdleResponseSchema,
+   UpdateAgentResponseMessageSchema,
+   ProjectRenameResponseSchema,
+   ProjectIconSetResponseSchema,
+diff --git a/packages/server/src/server/agent/agent-loading.ts b/packages/server/src/server/agent/agent-loading.ts
+index ba444a394..3421c0abb 100644
+--- a/packages/server/src/server/agent/agent-loading.ts
++++ b/packages/server/src/server/agent/agent-loading.ts
+@@ -26,6 +26,10 @@ interface PendingAgentInitialization {
+ 
+ const pendingAgentInitializations = new Map<string, PendingAgentInitialization>();
+ 
++export function isAgentLoading(agentId: string): boolean {
++  return pendingAgentInitializations.has(agentId);
++}
++
+ export type AgentLoaderManager = Pick<
+   AgentManager,
+   | "createAgent"
+@@ -84,21 +88,16 @@ export async function ensureAgentLoaded(
+     return existing;
+   }
+ 
+-  // A close may have started after the first barrier observed no in-flight
+-  // work. Once the live lookup is empty, this second barrier closes that gap
+-  // before storage-backed resume begins.
+-  await deps.agentManager.waitForAgentClose?.(agentId);
+-
+-  const laterInflight = pendingAgentInitializations.get(agentId);
+-  if (laterInflight) {
+-    laterInflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
+-    return laterInflight.promise;
+-  }
+-
+   const pendingOptions = {
+     broadcastTimeline: deps.broadcastTimeline === true,
+   };
+   const initPromise = (async () => {
++    // Reserve this load across the second lifecycle barrier. A guarded reload
++    // that already owns the lane opens the only writer. A later one sees this load.
++    await deps.agentManager.waitForAgentClose?.(agentId);
++    const openedWhileWaiting = deps.agentManager.getAgent(agentId);
++    if (openedWhileWaiting) return openedWhileWaiting;
++
+     const record = await deps.agentStorage.get(agentId);
+     if (!record) {
+       throw new AgentNotFoundError(agentId);
+diff --git a/packages/server/src/server/agent/agent-manager.test.ts b/packages/server/src/server/agent/agent-manager.test.ts
+index ccf29b17b..14796348e 100644
+--- a/packages/server/src/server/agent/agent-manager.test.ts
++++ b/packages/server/src/server/agent/agent-manager.test.ts
+@@ -2714,6 +2714,236 @@ test("reload releases the original writer before resuming the same session", asy
+   }
+ });
+ 
++test("idle reload reports busy while the provider is starting", async () => {
++  const client = new HeldAgentCreationClient();
++  const manager = new AgentManager({ clients: { codex: client }, logger });
++  const id = randomUUID();
++  const creating = manager.createAgent({ provider: "codex", cwd: process.cwd() }, id, {
++    workspaceId: undefined,
++  });
++  await client.waitForCreationToStart();
++  try {
++    expect(await manager.reloadAgentSessionIfIdle(id, "during-create")).toBeNull();
++  } finally {
++    client.finishCreating();
++    await creating;
++    await manager.closeAgent(id);
++  }
++});
++
++test("idle reload preserves a reserved turn and permission request", async () => {
++  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-idle-reload-busy-"));
++  const storage = new AgentStorage(join(workdir, "agents"), logger);
++  const client = new SessionRecordingAgentClient();
++  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
++  try {
++    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
++      workspaceId: undefined,
++    });
++    const session = client.sessions[0]!;
++    const interrupt = vi.spyOn(session, "interrupt");
++    const close = vi.spyOn(session, "close");
++    const running = manager.runAgent(agent.id, "finish this turn");
++    expect(await manager.reloadAgentSessionIfIdle(agent.id, "during-turn")).toBeNull();
++    await running;
++    session.pushEvent({
++      type: "permission_requested",
++      provider: "codex",
++      request: { id: "permission-1", provider: "codex", kind: "tool", name: "Read file" },
++    });
++    expect(await manager.reloadAgentSessionIfIdle(agent.id, "during-permission")).toBeNull();
++    expect(interrupt).not.toHaveBeenCalled();
++    expect(close).not.toHaveBeenCalled();
++    await manager.closeAgent(agent.id);
++  } finally {
++    await storage.flush();
++    rmSync(workdir, { recursive: true, force: true });
++  }
++});
++
++test("idle reload reserves the replacement for a prompt arriving during close", async () => {
++  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-idle-reload-new-prompt-"));
++  const storage = new AgentStorage(join(workdir, "agents"), logger);
++  const client = new HeldReloadCloseClient();
++  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
++  try {
++    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
++      workspaceId: undefined,
++    });
++    const original = vi.spyOn(agent.session!, "startTurn");
++    const reloading = manager.reloadAgentSessionIfIdle(agent.id, "switch-account");
++    await client.waitForCloseToStart();
++    const prompt = manager.runAgent(agent.id, "start on the replacement");
++    expect(await manager.reloadAgentSessionIfIdle(agent.id, "another-switch")).toBeNull();
++    expect(original).not.toHaveBeenCalled();
++    client.finishClosing();
++    const replacement = await reloading;
++    expect(replacement).not.toBeNull();
++    expect((await prompt).sessionId).toBe(replacement?.persistence?.sessionId);
++    expect(original).not.toHaveBeenCalled();
++    await manager.closeAgent(agent.id);
++  } finally {
++    client.finishClosing();
++    await storage.flush();
++    rmSync(workdir, { recursive: true, force: true });
++  }
++});
++
++test("a prompt waiting on a failed idle reload resumes the same thread normally and runs once", async () => {
++  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-failed-idle-reload-"));
++  const storage = new AgentStorage(join(workdir, "agents"), logger);
++  const client = new ResumeTrackingTestAgentClient();
++  const resumeStarted = deferred<void>();
++  const allowFailure = deferred<void>();
++  const resume = vi.spyOn(client, "resumeSession").mockImplementationOnce(async () => {
++    resumeStarted.resolve();
++    await allowFailure.promise;
++    throw new Error("target account could not resume the thread");
++  });
++  const openings: unknown[] = [];
++  const manager = new AgentManager({
++    clients: { codex: client },
++    registry: storage,
++    logger,
++    pluginLifecycle: {
++      emit: () => {},
++      before: async (name, request) => {
++        if (name === "agent.open.before") openings.push(request);
++        return request;
++      },
++    },
++  });
++  const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
++    workspaceId: undefined,
++  });
++  try {
++    const failure = expect(
++      manager.reloadAgentSessionIfIdle(created.id, "manual-switch"),
++    ).rejects.toThrow("target account");
++    await resumeStarted.promise;
++    const prompt = startAgentRun(manager, created.id, "continue my task", logger, {
++      runOptions: { clientMessageId: "user-prompt" },
++    });
++    allowFailure.resolve();
++    await failure;
++    expect((await prompt).disposition).toBe("turn_started");
++    await client.waitForRetryStart();
++    expect((await manager.waitForAgentEvent(created.id)).status).toBe("idle");
++    expect(resume.mock.calls.map(([handle]) => handle.sessionId)).toEqual([
++      created.persistence?.sessionId,
++      created.persistence?.sessionId,
++    ]);
++    expect(openings).toEqual([
++      expect.objectContaining({ reason: "create" }),
++      expect.objectContaining({ reason: "refresh", reloadRequestId: "manual-switch" }),
++      expect.objectContaining({ reason: "resume", purpose: "interactive" }),
++    ]);
++    expect(openings[2]).not.toHaveProperty("reloadRequestId");
++    expect(
++      manager.getTimeline(created.id).filter((item) => item.type === "user_message"),
++    ).toMatchObject([{ text: "continue my task", clientMessageId: "user-prompt" }]);
++  } finally {
++    allowFailure.resolve();
++    await manager.closeAgent(created.id);
++    await storage.flush();
++    rmSync(workdir, { recursive: true, force: true });
++  }
++});
++
++test.each(["open", "reload"] as const)(
++  "cold idle reload and open resume once when %s starts first",
++  async (first) => {
++    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cold-idle-reload-"));
++    const storage = new AgentStorage(join(workdir, "agents"), logger);
++    const client = new TestAgentClient();
++    const resumeStarted = deferred<void>();
++    const allowResume = deferred<void>();
++    const originalResume = client.resumeSession.bind(client);
++    const resume = vi.spyOn(client, "resumeSession").mockImplementation(async (...args) => {
++      resumeStarted.resolve();
++      await allowResume.promise;
++      return originalResume(...args);
++    });
++    const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
++    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
++      workspaceId: undefined,
++    });
++    try {
++      await manager.closeAgent(created.id);
++      const open = () =>
++        ensureAgentLoaded(created.id, { agentManager: manager, agentStorage: storage, logger });
++      const reload = () => manager.reloadAgentSessionIfIdle(created.id, "switch");
++      const firstResult = first === "open" ? open() : reload();
++      await resumeStarted.promise;
++      const secondResult = first === "open" ? reload() : open();
++      allowResume.resolve();
++      const [winner, second] = await Promise.all([firstResult, secondResult]);
++      expect(winner?.id).toBe(created.id);
++      if (first === "open") expect(second).toBeNull();
++      else expect(second?.session).toBe(winner?.session);
++      expect(resume).toHaveBeenCalledTimes(1);
++      expect(resume.mock.calls[0]?.[0].sessionId).toBe(created.persistence?.sessionId);
++    } finally {
++      allowResume.resolve();
++      await manager.closeAgent(created.id);
++      await storage.flush();
++      rmSync(workdir, { recursive: true, force: true });
++    }
++  },
++);
++
++test("idle reload opens a closed agent interactively, correlates each refresh, and preserves archives", async () => {
++  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-idle-reload-closed-"));
++  const storage = new AgentStorage(join(workdir, "agents"), logger);
++  const client = new TestAgentClient();
++  const resume = vi.spyOn(client, "resumeSession");
++  const openings: unknown[] = [];
++  const manager = new AgentManager({
++    clients: { codex: client },
++    registry: storage,
++    logger,
++    pluginLifecycle: {
++      emit: () => {},
++      before: async (name, request) => {
++        if (name === "agent.open.before") openings.push(request);
++        return request;
++      },
++    },
++  });
++  try {
++    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
++      workspaceId: "wks_test",
++    });
++    await manager.closeAgent(agent.id);
++    const fromDisk = await manager.reloadAgentSessionIfIdle(agent.id, "nonresident");
++    expect(fromDisk?.id).toBe(agent.id);
++    expect(resume.mock.calls[0]?.[0].sessionId).toBe(agent.persistence?.sessionId);
++    expect(await manager.reloadAgentSessionIfIdle(agent.id, "resident")).toBeTruthy();
++    expect(openings).toEqual([
++      expect.objectContaining({ reason: "create" }),
++      ...["nonresident", "resident"].map((reloadRequestId) =>
++        expect.objectContaining({
++          agentId: agent.id,
++          workspaceId: "wks_test",
++          purpose: "interactive",
++          reason: "refresh",
++          reloadRequestId,
++        }),
++      ),
++    ]);
++    await manager.archiveAgent(agent.id);
++    const archived = await storage.get(agent.id);
++    await expect(manager.reloadAgentSessionIfIdle(agent.id, "archived")).rejects.toThrow(
++      "archived",
++    );
++    expect((await storage.get(agent.id))?.archivedAt).toBe(archived?.archivedAt);
++    expect(resume).toHaveBeenCalledTimes(2);
++  } finally {
++    await storage.flush();
++    rmSync(workdir, { recursive: true, force: true });
++  }
++});
++
+ test("opening during reload waits for the replacement", async () => {
+   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reload-open-"));
+   const storage = new AgentStorage(join(workdir, "agents"), logger);
+diff --git a/packages/server/src/server/agent/agent-manager.ts b/packages/server/src/server/agent/agent-manager.ts
+index 94250e5cd..08e7bf901 100644
+--- a/packages/server/src/server/agent/agent-manager.ts
++++ b/packages/server/src/server/agent/agent-manager.ts
+@@ -99,7 +99,13 @@ import {
+   type ProviderSubagentStoreEvent,
+ } from "./provider-subagents/store.js";
+ import { withTimeout } from "../../utils/promise-timeout.js";
+-import { extractAttention } from "../persistence-hooks.js";
++import {
++  buildConfigOverrides,
++  extractAttention,
++  extractTimestamps,
++  toAgentPersistenceHandle,
++} from "../persistence-hooks.js";
++import { ensureUnarchivedAgentLoaded, isAgentLoading } from "./agent-loading.js";
+ 
+ const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
+ const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+@@ -770,6 +776,7 @@ export class AgentManager {
+   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
+   private readonly backgroundTasks = new Set<Promise<void>>();
+   private readonly agentRegistrationTasks = new Set<Promise<void>>();
++  private readonly idleReloads = new Map<string, Promise<ManagedAgent | null>>();
+   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
+   private readonly reloadedSessionCloses = new WeakMap<AgentSession, Promise<void>>();
+   private readonly runtimeCleanupIdentities = new WeakMap<AgentSession, object>();
+@@ -1350,7 +1357,12 @@ export class AgentManager {
+     agentId: string | undefined,
+     options: CreateAgentOptions,
+   ): Promise<ManagedAgent> {
+-    return this.trackAgentRegistrationOperation(this.createAgentInternal(config, agentId, options));
++    const resolvedAgentId = agentId ?? this.idFactory();
++    return this.trackAgentRegistrationOperation(
++      this.runLifecycleMutation(resolvedAgentId, () =>
++        this.createAgentInternal(config, resolvedAgentId, options),
++      ),
++    );
+   }
+ 
+   private async createAgentInternal(
+@@ -1469,6 +1481,7 @@ export class AgentManager {
+       attention?: AttentionState;
+     },
+     resumeOptions?: AgentResumeSessionOptions,
++    reloadRequestId?: string,
+   ): Promise<ManagedAgent> {
+     this.assertAcceptingAgentRegistrations();
+     const resolvedAgentId = validateAgentId(
+@@ -1512,7 +1525,8 @@ export class AgentManager {
+       paseoToolPolicy,
+       launchEnv,
+       {
+-        reason: "resume",
++        reason: reloadRequestId === undefined ? "resume" : "refresh",
++        reloadRequestId,
+         purpose,
+         workspaceId: options?.workspaceId ?? null,
+         title: record?.title ?? mergedConfig.title ?? null,
+@@ -1634,24 +1648,109 @@ export class AgentManager {
+     options?: { rehydrateFromDisk?: boolean },
+   ): Promise<ManagedAgent> {
+     return this.trackAgentRegistrationOperation(
+-      this.runLifecycleMutation(agentId, () =>
+-        this.reloadAgentSessionInternal(agentId, overrides, options),
+-      ),
++      this.runLifecycleMutation(agentId, async () => {
++        this.assertAcceptingAgentRegistrations();
++        if (this.hasInFlightRun(agentId)) await this.cancelAgentRunBefore(agentId, "reload");
++        return this.reloadAgentSessionInternal(agentId, overrides, options);
++      }),
+     );
+   }
+ 
+-  private async reloadAgentSessionInternal(
++  /** Reserve the idle runtime before asynchronous preparation, so a later prompt enters the replacement. */
++  reloadAgentSessionIfIdle(agentId: string, requestId: string): Promise<ManagedAgent | null> {
++    if (
++      this.idleReloads.has(agentId) ||
++      this.lifecycleMutationTails.has(agentId) ||
++      this.foregroundMutationTails.has(agentId) ||
++      isAgentLoading(agentId) ||
++      this.isBusyForReload(agentId)
++    ) {
++      return Promise.resolve(null);
++    }
++    const operation = this.trackAgentRegistrationOperation(
++      this.runLifecycleMutation(agentId, () => this.reloadIdleAgentUnlocked(agentId, requestId)),
++    );
++    this.idleReloads.set(agentId, operation);
++    const clear = () => {
++      if (this.idleReloads.get(agentId) === operation) this.idleReloads.delete(agentId);
++    };
++    void operation.then(clear, clear);
++    return operation;
++  }
++
++  pendingIdleReloadForPrompt(agentId: string): Promise<ManagedAgent | null> | undefined {
++    // The switch caller owns its failure. A prompt arriving during the switch
++    // opens the durable conversation normally if the previous runtime was closed.
++    return this.idleReloads.get(agentId)?.catch(() => {
++      if (!this.registry) return this.requireSessionAgent(agentId);
++      return ensureUnarchivedAgentLoaded(agentId, {
++        agentManager: this,
++        agentStorage: this.registry,
++        logger: this.logger,
++      });
++    });
++  }
++
++  private isBusyForReload(agentId: string): boolean {
++    const agent = this.agents.get(agentId);
++    return (
++      !!agent &&
++      (agent.lifecycle === "initializing" ||
++        this.hasInFlightRun(agentId) ||
++        !!agent.activeTurnId ||
++        agent.pendingPermissions.size > 0 ||
++        agent.inFlightPermissionResponses.size > 0 ||
++        !!agent.pendingReplacement ||
++        this.providerSubagents.list(agent.id).some((child) => child.status === "running"))
++    );
++  }
++
++  private async reloadIdleAgentUnlocked(
++    agentId: string,
++    requestId: string,
++  ): Promise<ManagedAgent | null> {
++    const record = await this.registry?.get(agentId);
++    if (record?.archivedAt) throw new Error(`Agent is archived: ${agentId}`);
++    if (this.isBusyForReload(agentId)) return null;
++    const live = this.agents.get(agentId);
++    if (live) {
++      if (!live.persistence?.sessionId)
++        throw new Error(`Agent has no session to resume: ${agentId}`);
++      return this.reloadAgentSessionInternal(agentId, undefined, { reloadRequestId: requestId });
++    }
++    if (!record) throw new Error(`Agent not found: ${agentId}`);
++    const handle = toAgentPersistenceHandle(this.getRegisteredProviderIds(), record.persistence);
++    if (!handle) throw new Error(`Agent has no session to resume: ${agentId}`);
++    return this.resumeAgentFromPersistenceInternal(
++      handle,
++      buildConfigOverrides(record),
++      agentId,
++      { ...extractTimestamps(record), attention: extractAttention(record) },
++      { purpose: "interactive" },
++      requestId,
++    );
++  }
++
++  private reloadAgentSessionInternal(
+     agentId: string,
+     overrides?: Partial<AgentSessionConfig>,
+     options?: { rehydrateFromDisk?: boolean },
+-  ): Promise<ManagedAgent> {
++  ): Promise<ManagedAgent>;
++  private reloadAgentSessionInternal(
++    agentId: string,
++    overrides: undefined,
++    options: { reloadRequestId: string },
++  ): Promise<ManagedAgent | null>;
++  private async reloadAgentSessionInternal(
++    agentId: string,
++    overrides?: Partial<AgentSessionConfig>,
++    {
++      rehydrateFromDisk = false,
++      reloadRequestId,
++    }: { rehydrateFromDisk?: boolean; reloadRequestId?: string } = {},
++  ): Promise<ManagedAgent | null> {
+     this.assertAcceptingAgentRegistrations();
+-    let existing = this.requireSessionAgent(agentId);
+-    if (this.hasInFlightRun(agentId)) {
+-      await this.cancelAgentRunBefore(agentId, "reload");
+-      existing = this.requireSessionAgent(agentId);
+-    }
+-    const rehydrateFromDisk = options?.rehydrateFromDisk ?? false;
++    const existing = this.requireSessionAgent(agentId);
+     const preservedHistoryPrimed = existing.historyPrimed;
+     const preservedLastUsage = existing.lastUsage;
+     const preservedLastError = existing.lastError;
+@@ -1683,6 +1782,7 @@ export class AgentManager {
+         workspaceId: existing.workspaceId,
+         title: await this.resolveInitialPersistedTitle(agentId, existing.config, null),
+         labels: existing.labels,
++        reloadRequestId,
+       },
+     );
+     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+@@ -1694,6 +1794,10 @@ export class AgentManager {
+     }
+ 
+     let session: AgentSession | undefined;
++    if (reloadRequestId !== undefined) {
++      await this.drainSessionEvents(agentId);
++      if (this.isBusyForReload(agentId)) return null;
++    }
+     let closedExisting: ManagedAgentClosed | undefined;
+     let handedToRegistration = false;
+     try {
+@@ -1715,10 +1819,7 @@ export class AgentManager {
+       if (rehydrateFromDisk) {
+         // Wipe the in-memory timeline so registerSession mints a new epoch and
+         // hydrateTimelineFromProvider re-streams the freshly read provider history.
+-        this.timelineStore.delete(agentId);
+-        for (const event of this.providerSubagents.deleteParent(agentId)) {
+-          this.dispatch({ type: "provider_subagent", event });
+-        }
++        this.discardRuntimeHistory(agentId);
+       }
+ 
+       // Preserve existing labels and timeline during reload.
+@@ -2628,6 +2729,8 @@ export class AgentManager {
+     prompt: AgentPromptInput,
+     options?: AgentRunOptions,
+   ): Promise<boolean> {
++    const reload = this.pendingIdleReloadForPrompt(agentId);
++    if (reload) await reload;
+     if (this.collectingRuntimes.has(agentId) || !this.agents.has(agentId)) {
+       await this.waitForAgentClose(agentId);
+       await ensureAgentLoaded(agentId, {
+@@ -2765,6 +2868,16 @@ export class AgentManager {
+     }
+   }
+ 
++  private async *streamAgentAfterReload(
++    reload: Promise<ManagedAgent | null>,
++    agentId: string,
++    prompt: AgentPromptInput,
++    options?: AgentRunOptions,
++  ): AsyncGenerator<AgentStreamEvent> {
++    await reload;
++    yield* this.streamAgent(agentId, prompt, options);
++  }
++
+   private async *streamAfterRuntimeCollection(
+     agentId: string,
+     prompt: AgentPromptInput,
+@@ -2784,6 +2897,10 @@ export class AgentManager {
+     prompt: AgentPromptInput,
+     options?: AgentRunOptions,
+   ): AsyncGenerator<AgentStreamEvent> {
++    const reload = this.pendingIdleReloadForPrompt(agentId);
++    if (reload) {
++      return this.streamAgentAfterReload(reload, agentId, prompt, options);
++    }
+     if (this.collectingRuntimes.has(agentId) || (!this.agents.has(agentId) && this.registry))
+       return this.streamAfterRuntimeCollection(agentId, prompt, options);
+     const existingAgent = this.requireSessionAgent(agentId);
+@@ -2986,6 +3103,8 @@ export class AgentManager {
+     prompt: AgentPromptInput,
+     options?: AgentRunOptions,
+   ): Promise<AsyncGenerator<AgentStreamEvent>> {
++    const reload = this.pendingIdleReloadForPrompt(agentId);
++    if (reload) await reload;
+     const snapshot = this.requireAgent(agentId);
+     if (
+       snapshot.lifecycle !== "running" &&
+@@ -3052,6 +3171,8 @@ export class AgentManager {
+     prompt: AgentPromptInput,
+     options?: AgentSteerOptions,
+   ): Promise<ActiveTurnSteerDispatchResult> {
++    const reload = this.pendingIdleReloadForPrompt(agentId);
++    if (reload) await reload;
+     // A turn that is still starting has no id to steer yet. Replacing it would drop its
+     // prompt, so wait until it is accepted (or fails) and steer the turn it became.
+     await this.runs.waitForForegroundStart(agentId);
+@@ -3193,6 +3314,8 @@ export class AgentManager {
+   }
+ 
+   async waitForAgentRunStart(agentId: string, options?: WaitForAgentStartOptions): Promise<void> {
++    const reload = this.pendingIdleReloadForPrompt(agentId);
++    if (reload) await reload;
+     const snapshot = this.getAgent(agentId);
+     if (!snapshot) {
+       throw new Error(`Agent ${agentId} not found`);
+@@ -4085,9 +4208,13 @@ export class AgentManager {
+   }
+ 
+   private discardRetainedAgentState(agentId: string): void {
+-    this.timelineStore.delete(agentId);
+     this.paseoToolPolicies.delete(agentId);
+     this.detachPluginTools(agentId);
++    this.discardRuntimeHistory(agentId);
++  }
++
++  private discardRuntimeHistory(agentId: string): void {
++    this.timelineStore.delete(agentId);
+     for (const event of this.providerSubagents.deleteParent(agentId)) {
+       this.dispatch({ type: "provider_subagent", event });
+     }
+@@ -5573,6 +5700,7 @@ export class AgentManager {
+     env?: Record<string, string>,
+     opening?: {
+       reason: PluginSessionOpenRequest["reason"];
++      reloadRequestId?: string;
+       purpose: PluginSessionOpenRequest["purpose"];
+       workspaceId?: string | null;
+       title?: string | null;
+@@ -5585,13 +5713,15 @@ export class AgentManager {
+     let mcpServers: AgentSessionConfig["mcpServers"];
+     let mcpServerOwners: Record<string, string> | undefined;
+     if (this.pluginLifecycle) {
++      const { reloadRequestId, reason = "resume", purpose = "interactive" } = opening ?? {};
+       const request = {
+         agentId,
+         provider: client.provider,
+         cwd,
+         workspaceId: opening?.workspaceId ?? null,
+-        reason: opening?.reason ?? "resume",
+-        purpose: opening?.purpose ?? "interactive",
++        reason,
++        ...(reloadRequestId === undefined ? {} : { reloadRequestId }),
++        purpose,
+         env: { ...env },
+         title: opening?.title ?? null,
+         labels: opening?.labels ?? {},
+diff --git a/packages/server/src/server/agent/agent-prompt.ts b/packages/server/src/server/agent/agent-prompt.ts
+index dde5c02bb..b7c9e7e54 100644
+--- a/packages/server/src/server/agent/agent-prompt.ts
++++ b/packages/server/src/server/agent/agent-prompt.ts
+@@ -19,9 +19,10 @@ export type AgentRunController = Pick<
+   | "replaceAgentRun"
+   | "steerOrReplaceActiveTurn"
+   | "streamAgent"
+-> & {
+-  reloadAgentSession(agentId: string): Promise<unknown>;
+-};
++> &
++  Partial<Pick<AgentManager, "pendingIdleReloadForPrompt">> & {
++    reloadAgentSession(agentId: string): Promise<unknown>;
++  };
+ 
+ export interface StartAgentRunOptions {
+   /** Called after selecting the run, before consuming its events. */
+@@ -95,6 +96,8 @@ export async function startAgentRun(
+   logger: Logger,
+   options?: StartAgentRunOptions,
+ ): Promise<{ disposition: PromptDispatchDisposition }> {
++  const reload = agentManager.pendingIdleReloadForPrompt?.(agentId);
++  if (reload) await reload;
+   const snapshot = agentManager.getAgent(agentId);
+   logger.trace(
+     {
+diff --git a/packages/server/src/server/authorization/operation-permissions.ts b/packages/server/src/server/authorization/operation-permissions.ts
+index f7a5b1785..333e8a6cd 100644
+--- a/packages/server/src/server/authorization/operation-permissions.ts
++++ b/packages/server/src/server/authorization/operation-permissions.ts
+@@ -21,6 +21,7 @@ const INBOUND_PERMISSION = {
+   "agent.provider_subagents.list.request": "workspace.read",
+   "agent.provider_subagents.timeline.get.request": "workspace.read",
+   "agent.rewind.request": "workspace.write",
++  "agent.session.reload_if_idle.request": "workspace.write",
+   "agent.skills.get_status.request": "daemon.read",
+   "agent.skills.import_legacy_selection.request": "daemon.manage",
+   "agent.skills.reconcile.request": "daemon.manage",
+@@ -248,6 +249,7 @@ const OUTBOUND_PERMISSION = {
+   "agent.provider_subagents.timeline.get.response": "workspace.read",
+   "agent.provider_subagents.update": "workspace.read",
+   "agent.rewind.response": "workspace.write",
++  "agent.session.reload_if_idle.response": "workspace.write",
+   "agent.skills.get_status.response": "daemon.read",
+   "agent.skills.import_legacy_selection.response": "daemon.manage",
+   "agent.skills.reconcile.response": "daemon.manage",
+diff --git a/packages/server/src/server/plugins/lifecycle/index.ts b/packages/server/src/server/plugins/lifecycle/index.ts
+index d4f58cc78..c42b3c20a 100644
+--- a/packages/server/src/server/plugins/lifecycle/index.ts
++++ b/packages/server/src/server/plugins/lifecycle/index.ts
+@@ -99,6 +99,7 @@ const beforeSchemas = {
+       provider: z.string(),
+       cwd: z.string(),
+       reason: z.enum(["create", "resume", "refresh", "import"]),
++      reloadRequestId: z.string().optional(),
+       purpose: z.enum(["interactive", "history"]),
+       title: z.string().nullable(),
+       labels: z.record(z.string(), z.string()),
+@@ -227,6 +228,7 @@ export async function validateBeforeResult<Name extends keyof PluginWireBeforeRe
+       previous.provider !== next.provider ||
+       previous.cwd !== next.cwd ||
+       previous.reason !== next.reason ||
++      previous.reloadRequestId !== next.reloadRequestId ||
+       previous.purpose !== next.purpose ||
+       previous.title !== next.title ||
+       !isDeepStrictEqual(previous.labels, next.labels)
+diff --git a/packages/server/src/server/session.test.ts b/packages/server/src/server/session.test.ts
+index d1408f988..22b2bc834 100644
+--- a/packages/server/src/server/session.test.ts
++++ b/packages/server/src/server/session.test.ts
+@@ -467,6 +467,65 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
+   return new Session(sessionOptions);
+ }
+ 
++test("guarded reload responds to the calling request without opening or interrupting a busy agent", async () => {
++  const messages: SessionOutboundMessage[] = [];
++  const reloadAgentSessionIfIdle = vi
++    .fn()
++    .mockResolvedValueOnce(null)
++    .mockResolvedValueOnce({ id: "agent-1" });
++  const session = createSessionForTest({ messages, agentManager: { reloadAgentSessionIfIdle } });
++  for (const outcome of ["busy", "reloaded"]) {
++    const requestId = "guard-" + outcome;
++    await session.handleMessage({
++      type: "agent.session.reload_if_idle.request",
++      agentId: "agent-1",
++      requestId,
++    });
++    expect(reloadAgentSessionIfIdle).toHaveBeenCalledWith("agent-1", requestId);
++    expect(messages).toContainEqual({
++      type: "agent.session.reload_if_idle.response",
++      payload: { agentId: "agent-1", requestId, outcome },
++    });
++  }
++});
++
++test("guarded reload sends a provider failure as an rpc_error to its requesting socket", async () => {
++  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
++  const session = createSessionForTest({
++    targetedMessages,
++    agentManager: {
++      reloadAgentSessionIfIdle: vi
++        .fn()
++        .mockRejectedValue(new Error("target could not resume the thread")),
++    },
++  });
++  const source = {};
++  const otherSocket = {};
++  session.updateClientCapabilities({ owned_subscriptions: true }, source);
++  session.updateClientCapabilities({ owned_subscriptions: true }, otherSocket);
++  const request = {
++    type: "agent.session.reload_if_idle.request",
++    agentId: "agent-1",
++    requestId: "switch-failed",
++  } as const;
++  await session.handleMessage(request, source);
++  expect(targetedMessages.filter(({ message }) => message.type === "rpc_error")).toEqual([
++    {
++      source,
++      message: {
++        type: "rpc_error",
++        payload: {
++          requestId: request.requestId,
++          requestType: request.type,
++          code: "handler_error",
++          error: "Request failed: target could not resume the thread",
++        },
++      },
++    },
++  ]);
++  expect(targetedMessages.some((item) => item.source === otherSocket)).toBe(false);
++});
++
+ test("routes host-scoped agent skills requests through the daemon owner", async () => {
+   const messages: SessionOutboundMessage[] = [];
+   const status = {
+diff --git a/packages/server/src/server/session.ts b/packages/server/src/server/session.ts
+index 00c852948..f2ef0078e 100644
+--- a/packages/server/src/server/session.ts
++++ b/packages/server/src/server/session.ts
+@@ -2937,6 +2937,8 @@ export class Session {
+ 
+   private dispatchAgentConfigMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+     switch (msg.type) {
++      case "agent.session.reload_if_idle.request":
++        return this.handleReloadAgentIfIdle(msg);
+       case "set_agent_mode_request":
+         return this.agentConfigSession.handleSetAgentModeRequest(msg);
+       case "set_agent_model_request":
+@@ -4754,6 +4756,17 @@ export class Session {
+     }
+   }
+ 
++  private async handleReloadAgentIfIdle(
++    msg: Extract<SessionInboundMessage, { type: "agent.session.reload_if_idle.request" }>,
++  ): Promise<void> {
++    const { agentId, requestId } = msg;
++    const snapshot = await this.agentManager.reloadAgentSessionIfIdle(agentId, requestId);
++    this.emit({
++      type: "agent.session.reload_if_idle.response",
++      payload: { agentId, requestId, outcome: snapshot ? "reloaded" : "busy" },
++    });
++  }
++
+   private async handleRefreshAgentRequest(
+     msg: Extract<SessionInboundMessage, { type: "refresh_agent_request" }>,
+   ): Promise<void> {
+diff --git a/packages/server/src/server/websocket-server.ts b/packages/server/src/server/websocket-server.ts
+index 7089812d2..abc9aeea1 100644
+--- a/packages/server/src/server/websocket-server.ts
++++ b/packages/server/src/server/websocket-server.ts
+@@ -2108,6 +2108,7 @@ export class VoiceAssistantWebSocketServer {
+         providerUsageList: true,
+         // COMPAT(agentDetach): added in v0.1.98, remove gate after 2026-12-19 once daemon floor >= v0.1.98.
+         agentDetach: true,
++        agentReloadIfIdle: true,
+         // COMPAT(agentThinkingUpdate): added in v0.2.4, remove gate after 2027-01-28.
+         agentThinkingUpdate: true,
+         // COMPAT(daemonDiagnostics): added in v0.1.100, remove gate after 2026-12-25 once daemon floor >= v0.1.100.
+diff --git a/public-docs/plugins/hooks.md b/public-docs/plugins/hooks.md
+index b535821e6..4037f5776 100644
+--- a/public-docs/plugins/hooks.md
++++ b/public-docs/plugins/hooks.md
+@@ -279,16 +279,17 @@ Receives `{ request }`; only `env`, `tools`, and `mcpServers` may change, for th
+ }
+ ```
+ 
+-| Field         | Values                                                                                                                  |
+-| ------------- | ----------------------------------------------------------------------------------------------------------------------- |
+-| `workspaceId` | String or `null`                                                                                                        |
+-| `title`       | Read-only string or `null`; creation title on create, stored title on resume.                                           |
+-| `labels`      | Read-only string map; creation labels on create, stored labels on resume.                                               |
+-| `tools`       | Editable `AgentToolDefinition[]`, local to this plugin. See [Attach tools to agents](#attach-tools-to-agents).          |
+-| `mcpServers`  | Editable launch-only server map, local to this plugin. See [Inject MCP servers](#inject-mcp-servers).                   |
+-| `reason`      | `create`, `resume`, `refresh`, `import`                                                                                 |
+-| `purpose`     | `interactive`, `history`                                                                                                |
+-| `env`         | Launch override map; excludes the daemon's inherited environment. Replace the map to add, replace, or remove overrides. |
++| Field             | Values                                                                                                                  |
++| ----------------- | ----------------------------------------------------------------------------------------------------------------------- |
++| `workspaceId`     | String or `null`                                                                                                        |
++| `title`           | Read-only string or `null`; creation title on create, stored title on resume.                                           |
++| `labels`          | Read-only string map; creation labels on create, stored labels on resume.                                               |
++| `tools`           | Editable `AgentToolDefinition[]`, local to this plugin. See [Attach tools to agents](#attach-tools-to-agents).          |
++| `mcpServers`      | Editable launch-only server map, local to this plugin. See [Inject MCP servers](#inject-mcp-servers).                   |
++| `reloadRequestId` | Guarded refresh correlation ID, present only for the idle-only reload.                                                  |
++| `reason`          | `create`, `resume`, `refresh`, `import`                                                                                 |
++| `purpose`         | `interactive`, `history`                                                                                                |
++| `env`             | Launch override map; excludes the daemon's inherited environment. Replace the map to add, replace, or remove overrides. |
+ 
+ ### Inject environment variables on every session opening
+ 

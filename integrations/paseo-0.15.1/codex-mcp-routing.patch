@@ -1,0 +1,156 @@
+diff --git a/packages/server/src/server/agent/providers/codex-app-server-agent.ts b/packages/server/src/server/agent/providers/codex-app-server-agent.ts
+index 2aecd18e2120e9ddbe8ac575a3d43f21de26d89e..71b268cb531d7c0db6f63c2a63b609af5a9c81f5 100644
+--- a/packages/server/src/server/agent/providers/codex-app-server-agent.ts
++++ b/packages/server/src/server/agent/providers/codex-app-server-agent.ts
+@@ -892,6 +892,7 @@ function expandCodexCustomPrompt(template: string, args: string | undefined): st
+ }
+ 
+ interface CodexMcpServerConfig {
++  environment_id?: string;
+   url?: string;
+   http_headers?: Record<string, string>;
+   command?: string;
+@@ -5414,7 +5415,10 @@ export class CodexAppServerAgentSession implements AgentSession {
+     if (this.config.mcpServers) {
+       const mcpServers: Record<string, CodexMcpServerConfig> = {};
+       for (const [name, serverConfig] of Object.entries(this.config.mcpServers)) {
+-        mcpServers[name] = toCodexMcpConfig(serverConfig);
++        mcpServers[name] = {
++          ...this.providerOptions.mcp_servers?.[name],
++          ...toCodexMcpConfig(serverConfig),
++        };
+       }
+       innerConfig.mcp_servers = mcpServers;
+     }
+diff --git a/packages/server/src/server/agent/providers/codex-mcp-routing.test.ts b/packages/server/src/server/agent/providers/codex-mcp-routing.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7ebcb13714e96b5c0f008a73324255f24523a07
+--- /dev/null
++++ b/packages/server/src/server/agent/providers/codex-mcp-routing.test.ts
+@@ -0,0 +1,90 @@
++import { describe, expect, test } from "vitest";
++import { CodexAppServerAgentSession } from "./codex-app-server-agent.js";
++import { CodexProviderOptionsSchema } from "./codex/options.js";
++import { createFakeCodexAppServer } from "./codex/test-utils/fake-app-server.js";
++import { createTestLogger } from "../../../test-utils/test-logger.js";
++import type { AgentSessionConfig } from "../agent-sdk-types.js";
++
++describe("Codex MCP environment routing", () => {
++  test.each([false, true])(
++    "preserves dynamic addresses and credentials on resumed=%s and later turns",
++    async (resumed) => {
++      const server = createFakeCodexAppServer();
++      const config: AgentSessionConfig = {
++        provider: "codex",
++        cwd: "/tmp/codex-mcp-routing",
++        model: "gpt-5.4",
++        modeId: "full-access",
++        providerOptions: { mcp_servers: { paseo: { environment_id: "mac" } } },
++        mcpServers: {
++          paseo: {
++            type: "http",
++            url: "http://127.0.0.1:48219/mcp/agents?callerAgentId=test-agent",
++            headers: { Authorization: "Bearer fixture-token" },
++          },
++          local: { type: "stdio", command: "example-mcp", args: ["--readonly"] },
++        },
++        toolPolicy: { preapproved: [{ kind: "mcp", server: "paseo", tool: "list_agents" }] },
++      };
++      const session = new CodexAppServerAgentSession(
++        config,
++        resumed ? { sessionId: "thread-1" } : null,
++        createTestLogger(),
++        async () => server.child,
++      );
++      try {
++        await session.startTurn("first");
++        server.completeTurn();
++        await new Promise<void>((resolve) => setImmediate(resolve));
++        await new Promise<void>((resolve) => setImmediate(resolve));
++        await session.startTurn("next");
++        const requests = server
++          .requests()
++          .filter((request) =>
++            [resumed ? "thread/resume" : "thread/start", "turn/start"].includes(request.method),
++          );
++        expect(requests.filter((request) => request.method === "turn/start")).toHaveLength(2);
++        expect(
++          requests.some(
++            (request) => request.method === (resumed ? "thread/resume" : "thread/start"),
++          ),
++        ).toBe(true);
++        for (const request of requests) {
++          expect(request.params).toMatchObject({
++            config: {
++              mcp_servers: {
++                paseo: {
++                  environment_id: "mac",
++                  url:
++                    config.mcpServers!.paseo!.type === "http" ? config.mcpServers!.paseo!.url : "",
++                  http_headers: { Authorization: "Bearer fixture-token" },
++                  tools: { list_agents: { approval_mode: "approve" } },
++                },
++                local: { command: "example-mcp", args: ["--readonly"] },
++              },
++            },
++          });
++          expect(request.params).not.toHaveProperty("config.mcp_servers.local.environment_id");
++        }
++        server.assertNoErrors();
++      } finally {
++        await session.close();
++      }
++    },
++  );
++
++  test("accepts a named environment and rejects blank routes and transport overrides", () => {
++    expect(
++      CodexProviderOptionsSchema.parse({ mcp_servers: { paseo: { environment_id: "mac" } } }),
++    ).toEqual({ mcp_servers: { paseo: { environment_id: "mac" } } });
++    expect(
++      CodexProviderOptionsSchema.safeParse({ mcp_servers: { paseo: { environment_id: " " } } })
++        .success,
++    ).toBe(false);
++    expect(
++      CodexProviderOptionsSchema.safeParse({
++        mcp_servers: { paseo: { environment_id: "mac", url: "http://stale" } },
++      }).success,
++    ).toBe(false);
++  });
++});
+diff --git a/packages/server/src/server/agent/providers/codex/options.ts b/packages/server/src/server/agent/providers/codex/options.ts
+index 8efd42d783d39ec108b6ca382346dc8fb1f96e7d..9cc66de62b728dea4cb3d629ac7fc7d1435c4e12 100644
+--- a/packages/server/src/server/agent/providers/codex/options.ts
++++ b/packages/server/src/server/agent/providers/codex/options.ts
+@@ -49,6 +49,9 @@ export const CodexProviderOptionsSchema = z
+       .strict()
+       .optional(),
+     web_search: z.enum(["disabled", "cached", "indexed", "live"]).optional(),
++    mcp_servers: z
++      .record(z.string(), z.object({ environment_id: z.string().trim().min(1) }).strict())
++      .optional(),
+     features: z
+       .object({
+         network_proxy: z.union([z.boolean(), NetworkPolicySchema]).optional(),
+diff --git a/public-docs/sdk/provider-options.md b/public-docs/sdk/provider-options.md
+index 54508902248a166d7d7762f3594d665b346c863c..2c6927954cae54ebf9661867a8963561803defe0 100644
+--- a/public-docs/sdk/provider-options.md
++++ b/public-docs/sdk/provider-options.md
+@@ -92,9 +92,17 @@ await client.close();
+ | `sandbox_workspace_write` | `writable_roots`, `network_access`, `exclude_slash_tmp`, `exclude_tmpdir_env_var` |
+ | `web_search`              | `disabled`, `cached`, `indexed`, `live`                                           |
+ | `features`                | `multi_agent_v2`, `network_proxy` (boolean or a proxy/domain policy object)       |
++| `mcp_servers`             | Named MCP routing overrides, e.g. `{ paseo: { environment_id: "mac" } }`          |
+ 
+ `approval_policy: "never"` only removes the prompts. What the agent is allowed to touch is `sandbox_mode`. Setting `never` without a sandbox mode gives an unattended agent full access.
+ 
++When the Codex process runs remotely, set `mcp_servers.paseo.environment_id` to the
++Codex execution environment that can reach your Paseo daemon. The environment must
++already exist in Codex's configuration. This selects where the MCP connection runs;
++Paseo still supplies the session's address and authentication headers. Omit the
++option to use Codex's default MCP routing. You can set it on one custom Codex provider
++under `agents.providers.<id>.options` without changing other providers.
++
+ ## Claude
+ 
+ Turn on Claude's own sandbox, restrict writes to the project, deny reads of credential directories, and allow only two domains:

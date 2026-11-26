@@ -1,0 +1,244 @@
+diff --git a/plugins/antigravity-provider/server/internal/history.ts b/plugins/antigravity-provider/server/internal/history.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..86f2b592c5a598071d2a3072c19267941953d88e
+--- /dev/null
++++ b/plugins/antigravity-provider/server/internal/history.ts
+@@ -0,0 +1,100 @@
++import { readFile } from "node:fs/promises";
++import { homedir } from "node:os";
++import path from "node:path";
++import { z } from "zod";
++import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
++
++const call = z.object({ name: z.string(), args: z.record(z.string(), z.json()) });
++const step = z.object({
++  step_index: z.number().int().nonnegative(),
++  created_at: z.iso.datetime({ offset: true }),
++  type: z.string(),
++  status: z.string(),
++  content: z.string().optional(),
++  tool_calls: z.array(call).optional(),
++});
++
++interface HistoryRow {
++  timestamp: string;
++  item: ProviderTimelineItem;
++}
++
++export async function readLocalHistory(
++  conversationId: string,
++  env: Record<string, string>,
++): Promise<HistoryRow[] | null> {
++  if (!z.uuid().safeParse(conversationId).success) return null;
++  const directory = path.join(
++    env.HOME || env.USERPROFILE || homedir(),
++    ".gemini",
++    "antigravity-cli",
++    "brain",
++    conversationId,
++    ".system_generated",
++    "logs",
++  );
++  for (const filename of ["transcript_full.jsonl", "transcript.jsonl"]) {
++    let data: string;
++    try {
++      data = await readFile(path.join(directory, filename), "utf8");
++    } catch (error) {
++      if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
++      throw error;
++    }
++    const rows = parseTranscript(data, conversationId);
++    if (rows.length > 0) return rows;
++  }
++  return null;
++}
++
++function parseTranscript(data: string, conversationId: string): HistoryRow[] {
++  const rows: HistoryRow[] = [];
++  let calls: z.infer<typeof call>[] = [];
++  for (const line of data.split("\n")) {
++    if (!line.trim()) continue;
++    const entry = step.parse(JSON.parse(line));
++    const id = `${conversationId}:${entry.step_index}`;
++    const push = (item: ProviderTimelineItem) => rows.push({ timestamp: entry.created_at, item });
++    const text = entry.content ?? "";
++    switch (entry.type) {
++      case "USER_INPUT": {
++        calls = [];
++        const user = /^<USER_REQUEST>\r?\n([\s\S]*)\r?\n<\/USER_REQUEST>(?:\r?\n|$)/.exec(text);
++        push({ type: "user_message", id, messageId: id, text: user?.[1] ?? text });
++        break;
++      }
++      case "PLANNER_RESPONSE":
++        calls = entry.tool_calls ?? [];
++        if (text) push({ type: "assistant_message", id, messageId: id, text });
++        break;
++      case "GENERIC": {
++        // Native transcripts list tool results in the planner's call order.
++        const invocation = calls.shift();
++        const name = invocation?.name ?? "Antigravity tool";
++        const base = {
++          id,
++          callId: id,
++          name,
++          detail: {
++            type: "unknown" as const,
++            input: invocation?.args ?? {},
++            output: text,
++          },
++        };
++        if (entry.status === "ERROR" || entry.status === "FAILED") {
++          push({ ...base, type: "tool_call", status: "failed", error: text });
++        } else {
++          let status: "running" | "canceled" | "completed" = "completed";
++          if (entry.status === "RUNNING") status = "running";
++          if (entry.status === "CANCELED") status = "canceled";
++          push({ ...base, type: "tool_call", status, error: null });
++        }
++        break;
++      }
++      case "ERROR_MESSAGE":
++        push({ type: "error", id, message: text });
++        break;
++    }
++  }
++  return rows;
++}
+diff --git a/plugins/antigravity-provider/server/internal/process.ts b/plugins/antigravity-provider/server/internal/process.ts
+index c87a17aadb44a709b47e30e0ff78e2ad53cbc3cc..8b04811b83efd1cc1fc4de716f7d5c429fd4fafd 100644
+--- a/plugins/antigravity-provider/server/internal/process.ts
++++ b/plugins/antigravity-provider/server/internal/process.ts
+@@ -112,7 +112,11 @@ export function startDriver(options: DriverOptions): Driver {
+         state = "ready";
+         resolveReady(decoded);
+       } else if (decoded.event === "result") {
+-        fail(new AntigravityError(diagnostic(decoded.result.error), "STARTUP_ERROR"));
++        // The CLI has sent its terminal frame and may already be exiting. Let stop("close")
++        // reap it before cleaning up the group so the native diagnostic reaches the caller.
++        clearTimeout(startupDeadline);
++        state = "stopping";
++        rejectReady(new AntigravityError(diagnostic(decoded.result.error), "STARTUP_ERROR"));
+       }
+       return;
+     }
+diff --git a/plugins/antigravity-provider/server/internal/session.ts b/plugins/antigravity-provider/server/internal/session.ts
+index caf2a62eeb8571ca4831b79dd8abd837cd0d8f37..78920b47afae5fe2858a87d7f75880a02d63d9c1 100644
+--- a/plugins/antigravity-provider/server/internal/session.ts
++++ b/plugins/antigravity-provider/server/internal/session.ts
+@@ -14,6 +14,7 @@ import type {
+ import { startDriver, selection, type Driver } from "./process.js";
+ import { validateSelection } from "./catalog.js";
+ import { PromptFiles } from "./prompt.js";
++import { readLocalHistory } from "./history.js";
+ import { toolItem } from "./timeline.js";
+ import { AntigravityError, diagnostic, type Frame, type Step } from "./wire.js";
+ 
+@@ -60,8 +61,17 @@ export class Session {
+     validateSelection(this.config, options.catalog());
+   }
+ 
+-  async open(requestId: string, capabilities: readonly string[]): Promise<void> {
+-    await this.ensureDriver();
++  async open(
++    requestId: string,
++    capabilities: readonly string[],
++    history: "skip" | "replay",
++  ): Promise<void> {
++    const rows =
++      history === "replay" && this.conversationId
++        ? await readLocalHistory(this.conversationId, this.options.launch.env)
++        : null;
++    // Opening a local transcript needs no authenticated CLI. prompt() starts it on demand.
++    if (!rows) await this.ensureDriver();
+     this.emit({
+       type: "session.opened",
+       requestId,
+@@ -72,6 +82,8 @@ export class Session {
+       cwd: this.config.cwd,
+       title: this.config.title,
+     });
++    for (const row of rows ?? [])
++      this.emit({ type: "timeline.item", sessionId: this.options.id, ...row });
+     this.publishFullAccessNotice();
+     this.publishConfig();
+     this.emit({ type: "session.commands", sessionId: this.options.id, commands: [] });
+@@ -232,7 +244,7 @@ export class Session {
+         });
+     } catch (error) {
+       this.state = { type: "dormant" };
+-      await driver.stop("interrupt");
++      await driver.stop("close");
+       throw error;
+     }
+   }
+diff --git a/plugins/antigravity-provider/server/provider.test.ts b/plugins/antigravity-provider/server/provider.test.ts
+index 631f10a6fec4775358723176c69bad5ce39e0032..c31837e000698048ae534582781631630ca5f8e3 100644
+--- a/plugins/antigravity-provider/server/provider.test.ts
++++ b/plugins/antigravity-provider/server/provider.test.ts
+@@ -1,4 +1,4 @@
+-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
++import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+ import os from "node:os";
+ import path from "node:path";
+ import { fileURLToPath } from "node:url";
+@@ -508,6 +508,47 @@ it("defers model and mode changes until the next prompt, then respawns with vali
+   );
+ });
+ 
++it("replays local messages and tool results without launching a signed-out CLI", async () => {
++  const home = await mkdtemp(path.join(os.tmpdir(), "antigravity-history-"));
++  temporary.push(home);
++  const id = "4f9c05a0-73f8-4343-b019-b8be0c8bb255";
++  const directory = path.join(
++    home,
++    ".gemini",
++    "antigravity-cli",
++    "brain",
++    id,
++    ".system_generated",
++    "logs",
++  );
++  await mkdir(directory, { recursive: true });
++  const timestamp = "2026-11-23T11:18:18Z";
++  const records = [
++    {
++      type: "USER_INPUT",
++      content: "<USER_REQUEST>\nOriginal question\n</USER_REQUEST>\n<ADDITIONAL_METADATA/>",
++    },
++    { type: "PLANNER_RESPONSE", tool_calls: [{ name: "read_file", args: { Path: "README.md" } }] },
++    { type: "GENERIC", content: "Original output" },
++    { type: "PLANNER_RESPONSE", content: "Original answer" },
++  ].map((record, index) =>
++    JSON.stringify({ step_index: index, status: "DONE", created_at: timestamp, ...record }),
++  );
++  await writeFile(path.join(directory, "transcript_full.jsonl"), records.join("\n"));
++  const h = await harness({ HOME: home, AGY_TEST_STARTUP: "auth" });
++  await h.open({ version: 1, data: { conversationId: id } });
++  expect(h.events.filter((event) => event.type === "timeline.item")).toMatchObject([
++    { timestamp, item: { type: "user_message", text: "Original question" } },
++    {
++      timestamp,
++      item: { type: "tool_call", name: "read_file", detail: { output: "Original output" } },
++    },
++    { timestamp, item: { type: "assistant_message", text: "Original answer" } },
++  ]);
++  expect(h.events.some((e) => e.type === "session.ready")).toBe(true);
++  expect((await h.records()).some((entry) => entry.args?.includes("--input-format"))).toBe(false);
++});
++
+ it("resumes after connection close without replay or another system prefix", async () => {
+   const first = await harness();
+   await first.open();
+diff --git a/plugins/antigravity-provider/server/provider.ts b/plugins/antigravity-provider/server/provider.ts
+index 88c73c7faa81c20cb342829b174395805909e9b5..d643b72e5603df744e75bcbfa87575508d94c846 100644
+--- a/plugins/antigravity-provider/server/provider.ts
++++ b/plugins/antigravity-provider/server/provider.ts
+@@ -101,7 +101,7 @@ function createConnection(
+         });
+         sessions.set(input.sessionId, opened);
+         try {
+-          await opened.open(input.requestId, negotiated);
++          await opened.open(input.requestId, negotiated, input.history);
+         } catch (error) {
+           sessions.delete(input.sessionId);
+           await opened.close();
