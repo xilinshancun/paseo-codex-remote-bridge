@@ -71,6 +71,7 @@ class AntigravityMcpServerTests(unittest.TestCase):
 
     def _wait_ready(self):
         deadline = time.monotonic() + 5.0
+        last_result = 'no response'
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
                 self.fail(f'MCP server exited early: {self.proc.stderr.read()!r}')
@@ -78,9 +79,11 @@ class AntigravityMcpServerTests(unittest.TestCase):
                 status, _, _ = self.request('POST', {'jsonrpc': '2.0', 'id': 0, 'method': 'ping'})
                 if status == 200:
                     return
-            except urllib.error.URLError:
-                time.sleep(0.05)
-        self.fail('MCP server did not start listening in time')
+                last_result = f'HTTP {status}'
+            except urllib.error.URLError as exc:
+                last_result = repr(exc.reason)
+            time.sleep(0.05)
+        self.fail(f'MCP ping on 127.0.0.1:{self.port} failed: {last_result}')
 
     def request(self, method, body=None, headers=None):
         req_headers = {'Authorization': f'Bearer {self.token}'}
@@ -97,9 +100,10 @@ class AntigravityMcpServerTests(unittest.TestCase):
                 raw = resp.read()
                 return resp.status, dict(resp.headers.items()), (json.loads(raw) if raw else None)
         except urllib.error.HTTPError as err:
-            raw = err.read()
-            parsed = json.loads(raw) if raw else None
-            return err.code, dict(err.headers.items()), parsed
+            with err:
+                raw = err.read()
+                parsed = json.loads(raw) if raw else None
+                return err.code, dict(err.headers.items()), parsed
 
     def test_fixed_actions_restrict_discovery_and_dispatch(self):
         self._stop_server()

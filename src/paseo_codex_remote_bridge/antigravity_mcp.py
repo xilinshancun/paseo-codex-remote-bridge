@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 import secrets
 import signal
+from socketserver import TCPServer
 import subprocess
 import sys
 import tempfile
@@ -431,6 +432,12 @@ def valid_origin_header(value):
 class McpHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def server_bind(self):
+        # Only a numeric loopback listener is advertised. Do not stall startup
+        # resolving the runner or launchd host name to produce a display name.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def __init__(self, server_address, state):
         super().__init__(server_address, McpRequestHandler)
