@@ -33,7 +33,7 @@ class InstallTests(unittest.TestCase):
     def run_install(self, args=None):
         return subprocess.run([sys.executable, str(ROOT / 'scripts/install.py')] +
                               (self.args if args is None else args), cwd=self.base,
-                              capture_output=True, timeout=10)
+                              capture_output=True, timeout=30)
 
     def create(self):
         result = self.run_install()
@@ -90,6 +90,22 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(item['id'], 'mac')
         self.assertEqual(item['url'], 'ws://127.0.0.1:18844')
         self.assertTrue(item['auth_bearer_token'] == (self.install / 'exec-server.token').read_text().strip())
+
+    def test_paseo_mcp_routing_is_an_opt_in_for_codex_only(self):
+        result = self.run_install(self.args + ['--route-paseo-mcp'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry, = json.loads((self.install / 'provider.json').read_text())['agents']['providers'].values()
+        self.assertEqual(entry['options'], {'mcp_servers': {'paseo': {'environment_id': 'mac'}}})
+        before = (self.install / 'provider.json').read_bytes()
+        self.assertNotEqual(self.run_install(['--update', '--install-dir', str(self.install),
+                                              '--route-paseo-mcp']).returncode, 0)
+        self.assertEqual((self.install / 'provider.json').read_bytes(), before)
+        for agent in ('antigravity', 'claude'):
+            dest = self.base / agent
+            result = self.run_install(['--agent', agent, '--ssh-host', 'devbox', '--route-paseo-mcp',
+                                       '--install-dir', str(dest)])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(dest.exists())
 
     def test_existing_install_and_empty_directory_are_refused(self):
         self.create()
@@ -292,6 +308,87 @@ class ClaudeInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.install / 'bridge.json').read_bytes(), before)
         self.assertNotEqual((self.install / 'claude_bridge.py').read_text(), 'old\n')
+
+
+class AntigravityInstallTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.install = self.base / 'antigravity bridge 空格'
+        self.args = ['--agent', 'antigravity', '--ssh-host', 'devbox-test',
+                     '--profile', 'agy-test', '--port', '18845',
+                     '--default-cwd', '/Users/example/projects/demo',
+                     '--mcp-server-name', 'mac',
+                     '--install-dir', str(self.install)]
+
+    def run_install(self, args=None):
+        return subprocess.run([sys.executable, str(ROOT / 'scripts/install.py')] +
+                              (self.args if args is None else args), cwd=self.base,
+                              capture_output=True, timeout=30)
+
+    def test_antigravity_generated_files_permissions_and_mcp_contract(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({x.name for x in self.install.iterdir()}, {
+            'antigravity-mcp-server', 'antigravity_mcp.py', 'bridge.json',
+            'mcp-server.token', 'remote-mcp_config.json',
+            'mcp-server.plist', 'ssh-tunnel.plist',
+        })
+        self.assertEqual(stat.S_IMODE(self.install.stat().st_mode), 0o700)
+        for name in ('bridge.json', 'mcp-server.token', 'remote-mcp_config.json'):
+            self.assertEqual(stat.S_IMODE((self.install / name).stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE((self.install / 'antigravity-mcp-server').stat().st_mode), 0o755)
+        token = (self.install / 'mcp-server.token').read_text().strip()
+        self.assertTrue(len(token) >= 32)
+        self.assertNotIn(token.encode(), result.stdout + result.stderr)
+
+        mcp_cfg = json.loads((self.install / 'remote-mcp_config.json').read_text())
+        entry = mcp_cfg['mcpServers']['mac']
+        self.assertEqual(entry['serverUrl'], 'http://127.0.0.1:18845/mcp')
+        self.assertTrue(entry['headers']['Authorization'] == 'Bearer ' + token)
+        self.assertEqual(entry['timeoutSeconds'], 600)
+        self.assertEqual(entry['tools']['exec'], {'eager': True})
+
+        local = plistlib.loads((self.install / 'mcp-server.plist').read_bytes())
+        tunnel = plistlib.loads((self.install / 'ssh-tunnel.plist').read_bytes())
+        self.assertEqual(local['ProgramArguments'], [
+            str(self.install / 'antigravity-mcp-server'),
+            '--listen', '127.0.0.1:18845',
+            '--token-file', str(self.install / 'mcp-server.token'),
+            '--default-cwd', '/Users/example/projects/demo',
+        ])
+        self.assertEqual(tunnel['ProgramArguments'], [
+            '/usr/bin/ssh', '-N', '-T', '-o', 'BatchMode=yes', '-o',
+            'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15', '-o',
+            'ServerAliveCountMax=3', '-R', '127.0.0.1:18845:127.0.0.1:18845', 'devbox-test',
+        ])
+        subprocess.run(['/bin/sh', '-n', str(self.install / 'antigravity-mcp-server')], check=True)
+
+    def test_antigravity_update_preserves_tokens_and_plists(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        protected = ('bridge.json', 'mcp-server.token', 'remote-mcp_config.json',
+                     'mcp-server.plist', 'ssh-tunnel.plist')
+        before = {n: ((self.install / n).read_bytes(), (self.install / n).stat().st_mode) for n in protected}
+        (self.install / 'antigravity_mcp.py').write_text('stale\n')
+        result = self.run_install(['--update', '--install-dir', str(self.install)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = {n: ((self.install / n).read_bytes(), (self.install / n).stat().st_mode) for n in protected}
+        self.assertTrue(before == after)
+        self.assertNotEqual((self.install / 'antigravity_mcp.py').read_text(), 'stale\n')
+
+    def test_antigravity_rejects_foreign_or_unsafe_flags(self):
+        bad_cases = [
+            self.args + ['--local-codex-bin', '/bin/codex'],
+            self.args + ['--local-claude-bin', '/bin/claude'],
+            ['--agent', 'antigravity', '--ssh-host', 'devbox', '--default-cwd', 'relative/path',
+             '--install-dir', str(self.install)],
+            ['--agent', 'antigravity', '--ssh-host', 'devbox', '--mcp-server-name', '../bad',
+             '--install-dir', str(self.install)],
+        ]
+        for case in bad_cases:
+            self.assertEqual(self.run_install(case).returncode, 2)
+            self.assertFalse(self.install.exists())
 
 
 if __name__ == '__main__':

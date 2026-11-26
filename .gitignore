@@ -16,6 +16,8 @@ auth.json.*
 bridge.json
 provider.json
 remote-environments.toml
+remote-mcp_config.json
+*.plist
 id_rsa
 id_ed25519
 id_ed25519_*

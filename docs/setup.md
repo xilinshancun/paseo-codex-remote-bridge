@@ -1,8 +1,6 @@
-# 安装、迁移与维护
+# 在 Mac 上接入远端 Codex
 
-执行接入的 agent 先按 [README](../README.md) 做完。Codex 和 Claude 是两条命令：Codex 生成 exec-server 凭证和反向隧道，Claude 不生成这两样。下面是 Codex 实例的细节。示例用 `devbox`、`codex-remote`、端口 `18733`。每个实例的 SSH 别名、配置目录、provider 名称和端口保持一致。
-
-Claude 的安装命令是 `python3 scripts/install.py --agent claude ...`。它不写 `environments.toml`，也不注册 launchd。登录在开发机的 Claude Code 上完成。
+示例使用 SSH 别名 `devbox`、provider `codex-remote` 和端口 `18733`。每个远端账号单独登录并使用自己的配置目录。Claude 和 Antigravity 的入口见[仓库首页](../README.md)。
 
 ## 1. 准备两端程序
 
@@ -66,7 +64,7 @@ ssh devbox 'umask 077; mkdir -p "$HOME/.codex-remote"; test ! -e "$HOME/.codex-r
   < "$BRIDGE_DIR/remote-environments.toml"
 ```
 
-这是上述实测 Codex CLI 使用的配置格式：默认工具环境是 `mac`，关闭开发机本地环境，并通过 `ws://127.0.0.1:18733` 访问 Mac 工具服务。文件位于本实例 `CODEX_HOME/environments.toml` 下。
+生成的配置指定默认工具环境为 `mac`，关闭开发机本地环境，并通过 `ws://127.0.0.1:18733` 访问 Mac 工具服务。文件位于本实例 `CODEX_HOME/environments.toml` 下。
 
 同一开发机上若同时连接两台 Mac，请为它们分别使用不同端口、provider 名称和远端 `CODEX_HOME`，避免工具被路由到另一台电脑。迁移同一实例时，应等旧会话结束、停止旧电脑对应隧道后再接入新电脑。
 
@@ -108,6 +106,8 @@ launchctl bootstrap "gui/$(id -u)" \
   }
 }
 ```
+
+要让 Codex 调用 Mac 上的 Paseo MCP，可按[宿主兼容说明](paseo-integrations.md#远端-codex-能读-mac-文件但调用不了-paseo-工具)选择路由。只需要执行项目命令与处理附件时，保留默认配置。
 
 应用配置后，在 Paseo 中选择该 provider。可以用其 CLI 检查：
 

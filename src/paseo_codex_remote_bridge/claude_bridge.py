@@ -12,8 +12,10 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import struct
 import subprocess
 import sys
+import unicodedata
 import urllib.request
 
 MAC_TOOLS = {'Bash', 'Read', 'Write', 'Edit', 'NotebookEdit', 'TaskStop'}
@@ -47,6 +49,8 @@ def load_config(folder=None):
     validate_host(config['ssh_host'])
     remote_path(config['remote_claude_bin'])
     remote_path(config['remote_session_root'])
+    if 'remote_claude_config_dir' in config:
+        remote_path(config['remote_claude_config_dir'])
     local = Path(config['local_claude_bin'])
     if not local.is_absolute():
         raise ValueError('local claude binary must be an absolute path')
@@ -57,6 +61,38 @@ def ssh_args(config):
     return ['/usr/bin/ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20',
             '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
             validate_host(config['ssh_host'])]
+
+
+def project_directory(path, *, darwin):
+    # Claude's JS encoder replaces and hashes UTF-16 code units, including both halves of emoji.
+    if darwin:
+        path = unicodedata.normalize('NFC', path)
+    units = [unit for (unit,) in struct.iter_unpack('<H', path.encode('utf-16-le'))]
+    slug = ''.join(chr(unit) if unit < 128 and chr(unit).isalnum() else '-' for unit in units)
+    if len(slug) <= 200:
+        return slug
+
+    hashed = 0
+    for unit in units:
+        hashed = (31 * hashed + unit) & 0xffffffff
+    magnitude = hashed if hashed < 0x80000000 else 0x100000000 - hashed
+    suffix = ''
+    while magnitude:
+        magnitude, digit = divmod(magnitude, 36)
+        suffix = '0123456789abcdefghijklmnopqrstuvwxyz'[digit] + suffix
+    return slug[:200] + '-' + (suffix or '0')
+
+
+def remote_claude_command(config, args, sdk=False):
+    env = []
+    if 'remote_claude_config_dir' in config:
+        env.append('CLAUDE_CONFIG_DIR=' + remote_path(config['remote_claude_config_dir']))
+    if sdk:
+        env.extend(['CLAUDE_CODE_ENTRYPOINT=sdk-ts', 'CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1'])
+    command = ['exec', 'env', *env] if env else ['exec']
+    command.append(remote_path(config['remote_claude_bin']))
+    command.extend(shlex.quote(arg) for arg in args)
+    return ' '.join(command)
 
 
 def compact(value):
@@ -212,10 +248,9 @@ class Bridge:
         self.folder, self.config = folder, config
         self.ssh = ssh_args(config)
         self.local_claude = str(Path(config['local_claude_bin']))
-        self.remote_claude = remote_path(config['remote_claude_bin'])
         self.cwd = str(Path.cwd().resolve())
         digest = hashlib.sha256(self.cwd.encode()).hexdigest()[:20]
-        self.remote_cwd_shell = remote_path(config['remote_session_root'].rstrip('/')) + '/' + digest
+        self.remote_cwd_shell = remote_path(config['remote_session_root'].rstrip('/') + '/' + digest)
         self.args, configs = transform_args(args)
         env = dict(os.environ)
         for key in list(env):
@@ -326,7 +361,7 @@ class Bridge:
             return
         async with self.sync_lock:
             probe = await asyncio.create_subprocess_exec(
-                *self.ssh, 'cd ' + self.remote_cwd_shell + ' && pwd',
+                *self.ssh, 'cd ' + self.remote_cwd_shell + ' && uname -s && pwd -P',
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             try:
                 data, _ = await asyncio.wait_for(probe.communicate(), 15)
@@ -336,31 +371,20 @@ class Bridge:
                 return
             if probe.returncode != 0:
                 return
-            absolute = data.decode().strip()
+            system, _, cwd = data.partition(b'\n')
+            absolute = cwd.removesuffix(b'\n').decode()
             if not absolute.startswith('/'):
                 return
-            folder = re.sub(r'[^a-zA-Z0-9]', '-', absolute)
-            listed = await asyncio.create_subprocess_exec(
-                *self.ssh, 'printf %s "$HOME/.claude/projects/' + folder + '/' + self.session + '.jsonl"',
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            try:
-                located, _ = await asyncio.wait_for(listed.communicate(), 15)
-            except asyncio.TimeoutError:
-                listed.kill()
-                await listed.wait()
-                return
-            if listed.returncode != 0 or not located.startswith(b'/'):
-                return
-            remote = located.decode()
+            folder = project_directory(absolute, darwin=system == b'Darwin')
+            config_dir = self.config.get('remote_claude_config_dir', '~/.claude')
+            history = config_dir.rstrip('/') + '/projects/' + folder + '/' + self.session + '.jsonl'
             process = await asyncio.create_subprocess_exec(
-                *self.ssh, 'cat -- ' + shlex.quote(remote),
+                *self.ssh, 'cat -- ' + remote_path(history),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             try:
                 body, _ = await asyncio.wait_for(process.communicate(), 15)
                 if process.returncode == 0 and body:
-                    local_folder = re.sub(r'[^a-zA-Z0-9]', '-', self.cwd)
-                    if len(local_folder) > 200:
-                        local_folder = 'remote-' + hashlib.sha256(self.cwd.encode()).hexdigest()
+                    local_folder = project_directory(self.cwd, darwin=sys.platform == 'darwin')
                     destination = self.folder / 'projects' / local_folder
                     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
                     path = destination / (self.session + '.jsonl')
@@ -375,10 +399,7 @@ class Bridge:
     async def run(self):
         (self.folder / 'tools').mkdir(parents=True, exist_ok=True, mode=0o700)
         command = ('mkdir -p ' + self.remote_cwd_shell + ' && cd ' + self.remote_cwd_shell
-                   + ' && exec env CLAUDE_CODE_ENTRYPOINT=sdk-ts CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1 '
-                   + self.remote_claude)
-        if self.args:
-            command += ' ' + shlex.join(self.args)
+                   + ' && ' + remote_claude_command(self.config, self.args, sdk=True))
         self.proc = await asyncio.create_subprocess_exec(
             *self.ssh, command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=None, limit=16 * 1024 * 1024)
@@ -413,8 +434,7 @@ def main(argv=None):
         os.write(2, b'claude remote bridge: invalid configuration\n')
         return 127
     if args in (['--version'], ['-v'], ['--help'], ['-h'], ['auth', 'status']):
-        remote = remote_path(config['remote_claude_bin'])
-        return subprocess.call([*ssh_args(config), 'exec ' + remote + (' ' + shlex.join(args) if args else '')])
+        return subprocess.call([*ssh_args(config), remote_claude_command(config, args)])
     if '--input-format' not in args or 'stream-json' not in args:
         print('This launcher is for Paseo/Claude Agent SDK streaming sessions. '
               'Use --version or auth status for diagnostics.', file=sys.stderr)
