@@ -29,7 +29,7 @@ Codex 执行项目命令和调用 Paseo MCP 是两条路径。前者由 `environ
 | 打开已有 Antigravity 本机会话时需要读取磁盘上的历史 | `antigravity-local-history.patch`，读取该用户已保存的 transcript。较新代码也可参考[上游 Antigravity 历史支持](https://github.com/getpaseo/paseo/pull/10193) | `plugins/antigravity-provider/server/provider.test.ts` |
 | 在现有聊天的模型菜单里选择账号，忙时排队、空闲时才重载 | `model-account-menu.patch`，提供模型菜单插件接口和 daemon 的空闲重载 RPC。还需下文的账号池插件提供实际账号 | `packages/server/src/server/session.test.ts`、`packages/app/src/plugins/evaluate.test.ts`、`packages/app/e2e/browser/plugin-buttons.spec.ts` |
 
-例如，先在此 bridge 仓库根目录记下补丁路径，然后创建独立的 Paseo 源码目录。下面只选择 MCP 路由。使用其它补丁时替换文件名和表中测试路径。
+例如，先在此 bridge 仓库根目录记下补丁路径，然后创建独立的 Paseo 源码目录。下面只选择 MCP 路由。其它补丁使用表中相应的测试。在 `packages/app` 目录运行其 Vitest 用例；模型菜单的浏览器用例使用 Playwright，可从 Paseo 根目录运行 `npm run test:e2e --workspace=@getpaseo/app -- e2e/browser/plugin-buttons.spec.ts --grep "the model menu shows"`。
 
 ```sh
 PATCH_DIR="$PWD/integrations/paseo-0.15.1"
@@ -59,13 +59,49 @@ cd account-switcher-pool
 git switch --detach ce0ff877086f9f2446424ea4b48afe41ff00ac43
 git apply --check "$POOL_PATCH"
 git apply "$POOL_PATCH"
-npm ci
+npm ci --ignore-scripts --legacy-peer-deps
 npm run build
 npm run typecheck
 npm test -- tests/codex-pool.test.ts tests/failover-row.test.ts tests/ui-failover-row.test.ts
 ```
 
-第一次验证时将这个目录安装到独立开发 daemon，例如 `paseo plugin install "$PWD" --host 127.0.0.1:6768`。检查该 daemon 的插件已启用。在打过补丁的插件源码中打开 `docs/installation.md` 的 **Configured Codex pools**，按其中的配置片段逐个接入 provider。每个远端账号的 `command` 指向本机生成的 bridge 启动器，`ssh` 取开发机别名，`home` 填开发机上该账号 Codex 配置目录的绝对路径。保留原配置备份，按插件说明启用 Codex 自动续跑。
+先在上节开发 daemon 的 `.dev/paseo-home/config.json` 中确认 `pluginsEnabled` 为 `true`，用同一 checkout 的 `npm run cli -- reload` 应用配置。然后从已构建的插件目录安装到开发 host：
+
+```sh
+DEV_HOST=127.0.0.1:6768
+paseo plugin install "$PWD" --host "$DEV_HOST"
+paseo plugin enable account-switcher --host "$DEV_HOST"
+paseo plugin ls --host "$DEV_HOST"
+```
+
+在打过补丁的插件源码中打开 `docs/installation.md` 的 **Configured Codex pools**，按其中的配置片段逐个接入 provider。例子中的开发 daemon 在 Mac 上的 `/path/to/paseo-0.15.1/.dev/paseo-home`；替换为你自己的绝对路径。启动器和 `--root`、`--config` 都指向这个开发实例。内层 `command` 指向原来能单独启动该账号的 Mac bridge，`home` 指向开发机上的 Codex 登录目录。保留 provider 已有的其它设置和环境变量。
+
+```json
+{
+  "command": [
+    "/path/to/paseo-0.15.1/.dev/paseo-home/account-switcher/bin/codex-pool-launcher",
+    "--root", "/path/to/paseo-0.15.1/.dev/paseo-home/account-switcher",
+    "--provider", "codex-work",
+    "--config", "/path/to/paseo-0.15.1/.dev/paseo-home/config.json",
+    "--"
+  ],
+  "env": {
+    "PASEO_CODEX_ACCOUNT_POOL": "{\"pool\":\"work\",\"command\":[\"/path/to/work-bridge/codex-remote\"],\"ssh\":\"devbox\",\"home\":\"/home/example/.codex-work\"}"
+  }
+}
+```
+
+第二个 provider 保持同一 `pool`，换成它自己的 provider ID、原启动器和账号目录。保存原 provider 配置后再合并，并在开发 checkout 运行 `npm run cli -- reload`。
+
+在插件的 Accounts 页面选择 Codex 的 **When a limit runs out during a chat → Switch automatically**。只有 SSH provider 的新安装可能看不到这个开关，因为这一版界面统计的是插件管理的登录。此时先确保开发插件至少成功启动过一次，再停用该插件，编辑它生成的注册表，保留其它字段并将 `autoFailover.codex` 设为 `true`。这里操作的都是开发实例：
+
+```sh
+DEV_HOME="/path/to/paseo-0.15.1/.dev/paseo-home"
+paseo plugin disable account-switcher --host "$DEV_HOST"
+${EDITOR:-vi} "$DEV_HOME/account-switcher/registry.json"
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["autoFailover"]["codex"] is True' "$DEV_HOME/account-switcher/registry.json" &&
+  paseo plugin enable account-switcher --host "$DEV_HOST"
+```
 
 模型菜单的账号选择还需在同一个 Paseo 源码目录应用 `model-account-menu.patch`，重新构建服务端并运行这份客户端。先用一个测试聊天确认手动切换后能继续同一原生线程，再在正在回复时排队并取消一次切换，确认正在运行的回复完整。账号池等待、额度失败和恢复的离线回归在 `tests/codex-pool.test.ts` 中。[插件基线](https://github.com/xilinshancun/paseo-plugin-account-switcher/tree/ce0ff877086f9f2446424ea4b48afe41ff00ac43) · [补丁及许可证](../integrations/account-switcher/)
 
